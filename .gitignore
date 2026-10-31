@@ -1,0 +1,61 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+
+# Generated runs and data: curate lawful examples separately
+/outputs/*
+!/outputs/README.md
+/data/
+*.log
+
+# Credentials and local editor/OS state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.DS_Store
+.idea/
+.vscode/
+
+# WorkSwarm runtime files (if generated inside this root)
+/.agent_history/
+/.checkpoint/
+/.logs/
+/.jiuwenswarm/
+/agents/
+/coding_memory/
+/context/
+/memory/
+/messages/
+/prompt_attachment/
+/sessions/
+/todo/
+/AGENT.md
+/HEARTBEAT.md
+/IDENTITY.md
+/SOUL.md
+/USER.md
+*.db
+*.db-wal
+*.db-shm
+.workspace
+
+# Local assignment documents are not approved for redistribution
+/final-project-instructions.pdf
+/final-project-instructions.md
+
+# Internal agent docs
+AGENTS.md
+STATUS.md
+GIT_WORKFLOW.md

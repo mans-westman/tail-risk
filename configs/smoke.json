@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "run_id": "smoke",
+  "dataset_id": "garch_student_t_smoke",
+  "dgp": {
+    "innovation": "student_t",
+    "omega": 0.000005,
+    "a": 0.05,
+    "b": 0.9,
+    "nu": 5,
+    "initial_variance": 0.0001,
+    "burn_in": 200
+  },
+  "partitions": {
+    "train": 500,
+    "validation": 200,
+    "test": 200
+  },
+  "seeds": {
+    "train": 11,
+    "validation": 22,
+    "test": 33
+  },
+  "alpha_grid": [0.005, 0.01, 0.025, 0.05, 0.1, 0.2],
+  "historical_window": 100
+}
