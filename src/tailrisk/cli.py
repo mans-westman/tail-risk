@@ -426,15 +426,36 @@ def cmd_report(run_dir: str) -> int:
         "",
         "## Metrics by split, model, and alpha (original return units)",
         "",
-        "| split | model | alpha | n | mean FZ0 | mean quantile loss | exceedance rate | VaR RMSE vs oracle | ES RMSE vs oracle |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "Scores use a common scoring mask: within each (series, alpha) cell every model is",
+        "scored on the same origins, so `n` is identical across models. `avail` is the",
+        "model's emitted row count, `failed` rows with a non-ok status, `masked` rows removed",
+        "to reach the shared set. A model with no overlap appears with n=0, not omitted.",
+        "",
+        "| split | model | alpha | n | avail | failed | masked | mean FZ0 | mean QL | exceed obs/exp | Kupiec p | Christoffersen p | VaR RMSE | ES RMSE |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
+
+    def _fmt(value: float, digits: int = 6) -> str:
+        return "nan" if not np.isfinite(value) else f"{value:.{digits}g}"
+
     for row in metrics.itertuples(index=False):
         lines.append(
-            f"| {row.split} | {row.model_id} | {row.alpha} | {row.n} | "
-            f"{row.mean_fz0:.6g} | {row.mean_quantile_loss:.6g} | {row.exceedance_rate:.4f} | "
-            f"{row.var_rmse_vs_oracle:.6g} | {row.es_rmse_vs_oracle:.6g} |"
+            f"| {row.split} | {row.model_id} | {row.alpha} | {row.n} | {row.n_available} | "
+            f"{row.n_failed_rows} | {row.n_dropped_by_mask} | {_fmt(row.mean_fz0)} | "
+            f"{_fmt(row.mean_quantile_loss)} | "
+            f"{row.exceedance_count}/{_fmt(row.exceedance_expected, 3)} | "
+            f"{_fmt(row.kupiec_p_uc, 4)} | {_fmt(row.christoffersen_p_ind, 4)} | "
+            f"{_fmt(row.var_rmse_vs_oracle)} | {_fmt(row.es_rmse_vs_oracle)} |"
         )
+    lines += [
+        "",
+        "Backtest diagnostics: Kupiec is the unconditional-coverage LR test (df=1),",
+        "Christoffersen the first-order independence LR test (df=1). `nan` means the test",
+        "was undefined for that cell (empty transition row, e.g. no exceedances) and is",
+        "reported as undefined rather than imputed. Observed exceedance counts at",
+        "alpha=0.005 are very sparse by construction; non-rejection is not proof of",
+        "correct calibration.",
+    ]
     lines += [
         "",
         "## Limitations",

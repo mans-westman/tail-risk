@@ -104,3 +104,150 @@ def test_report_requires_metrics_csv(tmp_path):
 
 def test_evaluate_rejects_missing_artifact(tmp_path):
     assert cmd_evaluate(str(tmp_path / "nowhere")) == 2
+
+
+def _hits_with(n: int, positions: list[int]) -> np.ndarray:
+    hits = np.zeros(n, dtype=bool)
+    hits[positions] = True
+    return hits
+
+
+def test_coverage_diagnostics_match_independent_likelihood():
+    """Reference values from the Bernoulli/Markov likelihoods, not from the implementation."""
+    from tailrisk.evaluation import coverage_diagnostics
+
+    d = coverage_diagnostics(_hits_with(250, [5, 15, 25, 35, 45, 55, 65, 75, 85, 86]), 0.01)
+    assert d["exceedance_count"] == 10
+    assert d["exceedance_expected"] == pytest.approx(2.5)
+    assert (d["n00"], d["n01"], d["n10"], d["n11"]) == (230, 9, 9, 1)
+    assert d["kupiec_lr_uc"] == pytest.approx(12.955491, rel=1e-6)
+    assert d["kupiec_p_uc"] == pytest.approx(3.1898e-4, rel=1e-3)
+    assert d["christoffersen_lr_ind"] == pytest.approx(0.705717, rel=1e-5)
+    assert d["christoffersen_p_ind"] == pytest.approx(0.400869, rel=1e-4)
+    assert d["christoffersen_lr_cc"] == pytest.approx(12.955491 + 0.705717, rel=1e-5)
+    assert d["christoffersen_p_cc"] == pytest.approx(1.08021e-3, rel=1e-3)
+
+
+def test_coverage_diagnostics_exact_coverage_has_zero_lr():
+    from tailrisk.evaluation import coverage_diagnostics
+
+    d = coverage_diagnostics(_hits_with(200, [10, 30, 50, 70, 90, 110, 130, 150, 170, 190]), 0.05)
+    # 10 hits out of 200 at alpha=0.05 is exactly the nominal rate.
+    assert d["kupiec_lr_uc"] == pytest.approx(0.0, abs=1e-9)
+    assert d["kupiec_p_uc"] == pytest.approx(1.0)
+
+
+def test_coverage_diagnostics_clustered_hits_reject_independence():
+    from tailrisk.evaluation import coverage_diagnostics
+
+    d = coverage_diagnostics(_hits_with(100, list(range(40, 60))), 0.10)
+    assert d["christoffersen_lr_ind"] == pytest.approx(80.967404, rel=1e-6)
+    assert d["christoffersen_p_ind"] < 1e-12
+    assert (d["n00"], d["n01"], d["n10"], d["n11"]) == (78, 1, 1, 19)
+
+
+def test_coverage_diagnostics_undefined_cases_are_nan_not_imputed():
+    from tailrisk.evaluation import coverage_diagnostics
+
+    no_hits = coverage_diagnostics(np.zeros(50, dtype=bool), 0.025)
+    assert no_hits["kupiec_lr_uc"] > 0.0 and np.isfinite(no_hits["kupiec_p_uc"])
+    assert np.isnan(no_hits["christoffersen_lr_ind"])
+    assert np.isnan(no_hits["christoffersen_p_ind"])
+    assert np.isnan(no_hits["christoffersen_lr_cc"])
+
+    all_hits = coverage_diagnostics(np.ones(50, dtype=bool), 0.025)
+    assert np.isnan(all_hits["christoffersen_lr_ind"])
+
+    # A single hit at the final origin leaves the state-1 transition row empty.
+    trailing = coverage_diagnostics(_hits_with(50, [49]), 0.025)
+    assert np.isnan(trailing["christoffersen_lr_ind"])
+
+    # The same isolated hit earlier in the sample keeps all four transition cells usable.
+    interior = coverage_diagnostics(_hits_with(50, [20]), 0.025)
+    assert np.isfinite(interior["christoffersen_lr_ind"])
+
+
+def test_evaluate_uses_common_mask_across_models():
+    origins_a = [str(i) for i in range(6)]
+    origins_b = [str(i) for i in range(2, 6)]
+    var = [-0.02] * 6
+    realized = [-0.03, 0.01, -0.04, 0.02, -0.025, 0.005]
+    forecasts = pd.DataFrame(
+        {
+            "series_id": ["ds_test"] * 10,
+            "model_id": ["model_a"] * 6 + ["model_b"] * 4,
+            "origin_date": origins_a + origins_b,
+            "target_date": [str(int(o) + 1) for o in origins_a + origins_b],
+            "alpha": [0.025] * 10,
+            "var": var + var[2:],
+            "es": [-0.03] * 10,
+            "realized_return": realized + realized[2:],
+            "scale": [0.01] * 10,
+            "status": ["ok"] * 10,
+        }
+    )
+    metrics = evaluate_forecasts(forecasts, pd.DataFrame(), "ds").set_index("model_id")
+
+    # model_b's four origins are the shared set; model_a loses its two warm-up rows.
+    assert metrics.loc["model_a", "n"] == 4
+    assert metrics.loc["model_b", "n"] == 4
+    assert metrics.loc["model_a", "n_available"] == 6
+    assert metrics.loc["model_a", "n_dropped_by_mask"] == 2
+    assert metrics.loc["model_b", "n_dropped_by_mask"] == 0
+
+    # The mean FZ0 must be the same-origin mean, not each model's full history.
+    expected = float(np.mean([fz0_loss(y, -0.02, -0.03, 0.025) for y in realized[2:]]))
+    assert metrics.loc["model_a", "mean_fz0"] == pytest.approx(expected)
+    assert metrics.loc["model_a", "mean_fz0"] == pytest.approx(metrics.loc["model_b", "mean_fz0"])
+
+
+def test_evaluate_counts_inadmissible_outputs_and_keeps_empty_cells():
+    forecasts = pd.DataFrame(
+        {
+            "series_id": ["ds_test"] * 6,
+            "model_id": ["model_a"] * 3 + ["model_b"] * 3,
+            "origin_date": ["0", "1", "2", "10", "11", "12"],
+            "alpha": [0.025] * 6,
+            "var": [-0.02] * 6,
+            "es": [-0.03, -0.03, 0.01, -0.03, -0.03, -0.03],
+            "realized_return": [0.01, -0.02, 0.0, 0.01, -0.02, 0.0],
+            "scale": [0.01] * 6,
+            "status": ["ok"] * 6,
+        }
+    )
+    metrics = evaluate_forecasts(forecasts, pd.DataFrame(), "ds").set_index("model_id")
+
+    # Disjoint origin ranges: the shared mask is empty, so cells are reported with n=0.
+    assert metrics.loc["model_a", "n"] == 0
+    assert metrics.loc["model_b", "n"] == 0
+    assert np.isnan(metrics.loc["model_a", "mean_fz0"])
+    # A positive ES is an inadmissible FZ0 output: flagged, not clipped into the score.
+    assert metrics.loc["model_a", "n_invalid_output"] == 1
+    assert metrics.loc["model_a", "n_available"] == 3
+    assert metrics.loc["model_b", "n_invalid_output"] == 0
+
+
+def test_evaluate_reports_models_that_failed_entirely():
+    forecasts = pd.DataFrame(
+        {
+            "series_id": ["ds_test"] * 6,
+            "model_id": ["model_a"] * 3 + ["model_b"] * 3,
+            "origin_date": ["0", "1", "2"] * 2,
+            "alpha": [0.025] * 6,
+            "var": [-0.02] * 6,
+            "es": [-0.03] * 6,
+            "realized_return": [0.01, -0.02, 0.0] * 2,
+            "scale": [0.01] * 6,
+            "status": ["ok"] * 3 + ["failed"] * 3,
+        }
+    )
+    metrics = evaluate_forecasts(forecasts, pd.DataFrame(), "ds").set_index("model_id")
+
+    # A model that never produced a usable row is still visible, with n=0 and NaN scores.
+    assert metrics.loc["model_b", "n"] == 0
+    assert metrics.loc["model_b", "n_failed_rows"] == 3
+    assert np.isnan(metrics.loc["model_b", "mean_fz0"])
+    # Its failure also empties the shared mask, so model_a cannot be scored alone.
+    assert metrics.loc["model_a", "n"] == 0
+    assert metrics.loc["model_a", "n_dropped_by_mask"] == 3
+    assert metrics.loc["model_a", "n_failed_rows"] == 0
