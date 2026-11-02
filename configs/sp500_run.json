@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "run_id": "sp500-real-20261102",
+  "dataset_id": "sp500_price_index",
+  "data": {
+    "kind": "returns_panel",
+    "panel": "data/sp500/panel.csv",
+    "audit": "data/sp500/data_audit.json"
+  },
+  "alpha_grid": [0.005, 0.01, 0.025, 0.05, 0.1, 0.2],
+  "historical_window": 100,
+  "models": ["historical_simulation", "garch_student_t"],
+  "protocol": "Frozen before scoring: guide section 4.5 cutoffs (train <= 2015-12-31, validation 2016-2019, test 2020-2025), splits by target date, 100-session trailing window, GARCH-t fitted once on train only. Not to be retuned after seeing validation or test results."
+}

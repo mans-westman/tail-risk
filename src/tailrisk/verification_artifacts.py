@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from .data import DataError, load_panel
 from .features import FEATURE_WARMUP, build_feature_frame
 from .historical import historical_var_es
 from .simulation import generate_partitions
-
-REQUIRED_ARTIFACTS = ("manifest.json", "config.resolved.json", "forecasts.csv", "oracle_curves.csv")
 
 FORECAST_COLUMNS = [
     "run_id", "dataset_id", "series_id", "model_id", "data_seed", "model_seed",
@@ -23,13 +23,26 @@ MODEL_GARCH_T = "garch_student_t"
 _KNOWN_MODELS = {MODEL_HISTORICAL, MODEL_GARCH_T}
 _VALID_STATUSES = {"ok", "failed", "missing"}
 
+# Artifacts every run writes. The oracle curve is separate because it exists only for
+# synthetic data: a real panel has no ground truth, and demanding an oracle file there
+# would force either a fake artifact or a permanent false failure.
+CORE_ARTIFACTS = ("manifest.json", "config.resolved.json", "forecasts.csv")
+ORACLE_ARTIFACT = "oracle_curves.csv"
+
 
 class ArtifactVerificationError(Exception):
     """Actionable error for missing or malformed run artifacts."""
 
 
-def _record(checks: list[dict], name: str, passed: bool, detail: str) -> None:
-    checks.append({"name": name, "passed": bool(passed), "detail": detail})
+def required_artifacts(dataset_kind: str) -> tuple[str, ...]:
+    """Artifacts a run of this kind must contain."""
+    if dataset_kind == "real":
+        return CORE_ARTIFACTS
+    return CORE_ARTIFACTS + (ORACLE_ARTIFACT,)
+
+
+def _record(checks: list[dict], name: str, passed: bool, detail: str, applicable: bool = True) -> None:
+    checks.append({"name": name, "passed": bool(passed), "detail": detail, "applicable": bool(applicable)})
 
 
 def _read_json(path: Path, label: str) -> dict:
@@ -58,24 +71,283 @@ def _read_csv(path: Path, label: str, required_columns: list[str]) -> pd.DataFra
     return frame
 
 
+@dataclass(frozen=True)
+class _Source:
+    """One series as re-derived by verification, independent of the run's own code path."""
+
+    split: str
+    series_id: str
+    returns: np.ndarray
+    origin_labels: tuple[str, ...]
+    target_labels: tuple[str, ...]
+
+    @property
+    def index_of(self) -> dict[str, int]:
+        return {label: index for index, label in enumerate(self.origin_labels)}
+
+
+def _rebuild_sources(resolved: dict) -> tuple[dict[str, _Source], dict | None]:
+    """Re-derive the run's series from config plus public inputs.
+
+    Synthetic runs regenerate paths from the declared DGP and seeds; real runs reload the
+    panel the config points at. Either way the returned series are built from inputs, not
+    copied from the forecast artifact under test.
+    """
+    if resolved.get("dataset_kind") == "real":
+        panel = (resolved.get("data") or {}).get("panel")
+        if not panel:
+            raise ArtifactVerificationError(
+                "config.resolved.json declares a real-data run without data.panel"
+            )
+        try:
+            splits = load_panel(panel)
+        except (DataError, OSError) as exc:
+            raise ArtifactVerificationError(f"panel referenced by the run is unusable: {exc}") from exc
+        sources = {
+            name: _Source(
+                split=name,
+                series_id=part.series_id,
+                returns=np.asarray(part.returns, dtype=float),
+                origin_labels=part.origin_dates,
+                target_labels=part.target_dates,
+            )
+            for name, part in splits.items()
+        }
+        return sources, None
+
+    partitions = generate_partitions(
+        resolved["partitions"],
+        resolved["seeds"],
+        **resolved["dgp"],
+        alphas=resolved["alpha_grid"],
+    )
+    dataset_id = resolved.get("dataset_id", "synthetic")
+    sources = {}
+    for name, path in partitions.items():
+        returns = np.asarray(path.returns, dtype=float)
+        sources[name] = _Source(
+            split=name,
+            series_id=f"{dataset_id}_{name}",
+            returns=returns,
+            origin_labels=tuple(str(index) for index in range(returns.size)),
+            target_labels=tuple(str(index) for index in range(1, returns.size)),
+        )
+    return sources, partitions
+
+
+def _session_chain(checks: list[dict], forecasts: pd.DataFrame, sources: dict[str, _Source], real: bool) -> None:
+    """Confirm every forecast targets the session that immediately follows its origin."""
+    name = "panel_target_is_next_session" if real else "synthetic_target_is_next_session"
+    expected: dict[tuple[str, str], str] = {}
+    for source in sources.values():
+        for origin, target in zip(source.origin_labels, source.target_labels):
+            expected[(source.series_id, origin)] = target
+
+    unknown: list[tuple[str, str]] = []
+    mismatched: list[tuple[str, str, str, str]] = []
+    for row in forecasts.itertuples(index=False):
+        key = (str(row.series_id), str(row.origin_date))
+        if key not in expected:
+            unknown.append(key)
+            continue
+        if expected[key] != str(row.target_date):
+            mismatched.append((key[0], key[1], str(row.target_date), expected[key]))
+
+    passed = not unknown and not mismatched
+    basis = "panel sessions" if real else "synthetic step indices"
+    detail = (
+        f"basis={basis}; {len(unknown)} origins not in the series, {len(mismatched)} mismatched targets"
+        + (f", e.g. {mismatched[:2]}" if mismatched else "")
+        + (f", e.g. {unknown[:2]}" if unknown else "")
+    )
+    _record(checks, name, passed, detail)
+
+
+def _replay(
+    checks: list[dict],
+    resolved: dict,
+    forecasts: pd.DataFrame,
+    oracle: pd.DataFrame,
+    sources: dict[str, _Source],
+    partitions: dict | None,
+    expected_models: set[str],
+    alpha_grid: list[float],
+    real: bool,
+) -> None:
+    """Rebuild realised returns, oracle values and model forecasts from scratch."""
+    name = "deterministic_panel_replay" if real else "deterministic_synthetic_replay"
+    ok = True
+    details: list[str] = []
+    try:
+        expected_returns: dict[tuple[str, str], float] = {}
+        for source in sources.values():
+            index_of = source.index_of
+            for label, target in zip(source.origin_labels, source.target_labels):
+                index = index_of[label]
+                expected_returns[(source.series_id, label)] = float(source.returns[index + 1])
+
+        mismatches = 0
+        compared = 0
+        for row in forecasts.itertuples(index=False):
+            key = (str(row.series_id), str(row.origin_date))
+            expected = expected_returns.get(key)
+            if expected is None:
+                mismatches += 1
+                continue
+            compared += 1
+            if not np.isclose(float(row.realized_return), expected, rtol=1e-12, atol=0.0):
+                mismatches += 1
+        if mismatches or compared == 0:
+            ok = False
+        details.append(f"realized_return mismatches={mismatches} compared={compared}")
+
+        if not real and partitions is not None and not oracle.empty:
+            expected_oracle: dict[tuple[str, str, str, float], tuple[float, float, float]] = {}
+            for split, path in partitions.items():
+                series_id = f"{resolved.get('dataset_id', 'synthetic')}_{split}"
+                for origin in range(path.returns.size - 1):
+                    target = origin + 1
+                    for alpha_index, alpha in enumerate(alpha_grid):
+                        expected_oracle[(series_id, str(origin), str(target), float(alpha))] = (
+                            float(path.sigma[target]),
+                            float(path.oracle_var[target, alpha_index]),
+                            float(path.oracle_es[target, alpha_index]),
+                        )
+            oracle_mismatches = 0
+            oracle_compared = 0
+            for row in oracle.itertuples(index=False):
+                key = (str(row.series_id), str(row.origin_date), str(row.target_date), float(row.alpha))
+                expected = expected_oracle.get(key)
+                if expected is None:
+                    oracle_mismatches += 1
+                    continue
+                oracle_compared += 1
+                sigma, oracle_var, oracle_es = expected
+                if not (
+                    np.isclose(float(row.sigma), sigma, rtol=1e-9, atol=1e-12)
+                    and np.isclose(float(row.oracle_var), oracle_var, rtol=1e-9, atol=1e-12)
+                    and np.isclose(float(row.oracle_es), oracle_es, rtol=1e-9, atol=1e-12)
+                ):
+                    oracle_mismatches += 1
+            if oracle_mismatches or oracle_compared == 0:
+                ok = False
+            details.append(f"oracle mismatches={oracle_mismatches} compared={oracle_compared}")
+
+        window = int(resolved["historical_window"])
+        origin_start = max(window, FEATURE_WARMUP - 1)
+
+        if MODEL_HISTORICAL in expected_models and not forecasts.empty:
+            historical_mismatches = 0
+            historical_compared = 0
+            for source in sources.values():
+                features = build_feature_frame(source.returns)
+                scale_by_origin = {int(r.origin_index): float(r.return_scale) for r in features.itertuples()}
+                subset = forecasts[
+                    (forecasts["series_id"] == source.series_id)
+                    & (forecasts["model_id"] == MODEL_HISTORICAL)
+                ]
+                index_of = source.index_of
+                for row in subset.itertuples(index=False):
+                    origin = index_of.get(str(row.origin_date))
+                    if origin is None or origin < origin_start or origin >= source.returns.size - 1:
+                        historical_mismatches += 1
+                        continue
+                    trailing = source.returns[origin - window + 1 : origin + 1]
+                    expected_var, expected_es = historical_var_es(trailing, float(row.alpha))
+                    historical_compared += 1
+                    if not (
+                        np.isclose(float(row.var), expected_var, rtol=1e-9, atol=1e-12)
+                        and np.isclose(float(row.es), expected_es, rtol=1e-9, atol=1e-12)
+                        and np.isclose(
+                            float(row.scale), scale_by_origin.get(origin, np.nan), rtol=1e-9, atol=1e-12
+                        )
+                    ):
+                        historical_mismatches += 1
+            if historical_mismatches or historical_compared == 0:
+                ok = False
+            details.append(
+                f"historical forecast mismatches={historical_mismatches} compared={historical_compared}"
+            )
+
+        if MODEL_GARCH_T in expected_models and not forecasts.empty:
+            from .models.garch_t import GarchStudentTModel
+
+            if "train" not in sources:
+                raise ArtifactVerificationError("a GARCH-t run must contain a train split")
+            # Refit from the training split alone; a fit that had used held-out returns
+            # would not reproduce these numbers.
+            model = GarchStudentTModel()
+            model.fit(sources["train"].returns)
+            garch_mismatches = 0
+            garch_compared = 0
+            for source in sources.values():
+                subset = forecasts[
+                    (forecasts["series_id"] == source.series_id)
+                    & (forecasts["model_id"] == MODEL_GARCH_T)
+                ]
+                index_of = source.index_of
+                expected_by_key = {
+                    (forecast.origin_index, float(forecast.alpha)): (
+                        forecast.var,
+                        forecast.es,
+                        forecast.scale,
+                    )
+                    for forecast in model.predict(source.returns, np.asarray(alpha_grid, dtype=float))
+                }
+                for row in subset.itertuples(index=False):
+                    origin = index_of.get(str(row.origin_date))
+                    key = (origin, float(row.alpha))
+                    if origin is None or key not in expected_by_key:
+                        garch_mismatches += 1
+                        continue
+                    e_var, e_es, e_scale = expected_by_key[key]
+                    garch_compared += 1
+                    if not (
+                        np.isclose(float(row.var), e_var, rtol=1e-7, atol=1e-12)
+                        and np.isclose(float(row.es), e_es, rtol=1e-7, atol=1e-12)
+                        and np.isclose(float(row.scale), e_scale, rtol=1e-7, atol=1e-12)
+                    ):
+                        garch_mismatches += 1
+            if garch_mismatches or garch_compared == 0:
+                ok = False
+            details.append(f"garch forecast mismatches={garch_mismatches} compared={garch_compared}")
+    except ArtifactVerificationError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - surface actionable replay failure
+        ok = False
+        details.append(f"replay failed: {exc}")
+
+    _record(checks, name, ok, "; ".join(details))
+
+
 def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
     """Verify actual artifacts of a run directory.
 
-    Returns (checks, passed). Raises ArtifactVerificationError for missing or
-    malformed required artifacts so the CLI can emit an actionable error.
+    Returns (checks, passed). Raises ArtifactVerificationError for missing or malformed
+    required artifacts so the CLI can emit an actionable error. Checks carry an
+    ``applicable`` flag: an inapplicable check is reported, never silently counted as a
+    pass, so a real-data run cannot look as though it validated against an oracle.
     """
     directory = Path(run_dir)
     if not directory.exists():
         raise ArtifactVerificationError(f"run directory not found: {directory}")
 
-    for name in REQUIRED_ARTIFACTS:
+    manifest = _read_json(directory / "manifest.json", "manifest")
+    resolved = _read_json(directory / "config.resolved.json", "config.resolved.json")
+    dataset_kind = resolved.get("dataset_kind") or manifest.get("dataset_kind") or "synthetic"
+    real = dataset_kind == "real"
+
+    for name in required_artifacts(dataset_kind):
         if not (directory / name).exists():
             raise ArtifactVerificationError(f"missing required artifact: {directory / name}")
 
-    manifest = _read_json(directory / "manifest.json", "manifest")
-    resolved = _read_json(directory / "config.resolved.json", "config.resolved.json")
     forecasts = _read_csv(directory / "forecasts.csv", "forecasts", FORECAST_COLUMNS)
-    oracle = _read_csv(directory / "oracle_curves.csv", "oracle_curves", ORACLE_COLUMNS)
+    oracle_path = directory / ORACLE_ARTIFACT
+    oracle = (
+        pd.DataFrame(columns=ORACLE_COLUMNS)
+        if real
+        else _read_csv(oracle_path, "oracle_curves", ORACLE_COLUMNS)
+    )
 
     checks: list[dict] = []
 
@@ -102,6 +374,29 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
         config_hash_matches,
         "manifest.config_hash_sha256 matches config.resolved.json",
     )
+
+    _record(
+        checks,
+        "dataset_kind_consistent",
+        resolved.get("dataset_kind") == manifest.get("dataset_kind"),
+        f"config={resolved.get('dataset_kind')!r} manifest={manifest.get('dataset_kind')!r}",
+    )
+
+    if real:
+        _record(
+            checks,
+            "oracle_absent_by_design",
+            not oracle_path.exists(),
+            f"{ORACLE_ARTIFACT} present={oracle_path.exists()}; a market-data run has no ground truth",
+        )
+        _record(
+            checks,
+            "oracle_comparisons",
+            False,
+            "not applicable: no oracle exists for market data, so oracle metrics are undefined "
+            "rather than passed",
+            applicable=False,
+        )
 
     alpha_grid = list(resolved.get("alpha_grid", []))
     expected_models = set(resolved.get("models", [MODEL_HISTORICAL]))
@@ -171,213 +466,66 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
         _record(checks, "original_unit_signed_ordering", ordering, "es <= var < 0 on ok rows")
         _record(checks, "original_unit_positive_scale", positive_scale, "scale > 0 on ok rows")
 
-        # Synthetic next-session convention: target_index = origin_index + 1.
-        try:
-            origins = forecasts["origin_date"].astype(int).to_numpy()
-            targets = forecasts["target_date"].astype(int).to_numpy()
-            next_session = bool(np.all(targets == origins + 1))
-        except (ValueError, TypeError):
-            next_session = False
-        _record(
-            checks,
-            "synthetic_target_is_next_session",
-            next_session,
-            "target_index == origin_index + 1 for synthetic step identifiers",
-        )
-
     # --- oracle table checks ---------------------------------------------------
-    if oracle.empty:
-        _record(checks, "oracle_nonempty", False, "oracle_curves.csv contains zero rows")
-    else:
-        _record(checks, "oracle_nonempty", True, f"{len(oracle)} oracle rows")
+    if not real:
+        if oracle.empty:
+            _record(checks, "oracle_nonempty", False, "oracle_curves.csv contains zero rows")
+        else:
+            _record(checks, "oracle_nonempty", True, f"{len(oracle)} oracle rows")
 
-    if not oracle.empty:
-        oracle_key = ["series_id", "origin_date", "target_date", "alpha"]
-        oracle_unique = not oracle.duplicated(subset=oracle_key).any()
-        _record(checks, "oracle_keys_unique", oracle_unique, f"key={oracle_key}")
-
-        oracle_numeric = ["alpha", "sigma", "oracle_var", "oracle_es"]
-        oracle_finite = True
-        for col in oracle_numeric:
-            values = pd.to_numeric(oracle[col], errors="coerce").to_numpy(dtype=float)
-            if not np.all(np.isfinite(values)):
-                oracle_finite = False
-                break
-        _record(checks, "oracle_values_finite", oracle_finite, f"columns={oracle_numeric}")
-
-        oracle_var_vals = oracle["oracle_var"].astype(float).to_numpy()
-        oracle_es_vals = oracle["oracle_es"].astype(float).to_numpy()
-        sigma_vals = oracle["sigma"].astype(float).to_numpy()
-        _record(
-            checks,
-            "oracle_signed_ordering",
-            bool(np.all(oracle_es_vals <= oracle_var_vals) and np.all(oracle_var_vals < 0.0)),
-            "oracle_es <= oracle_var < 0",
-        )
-        _record(
-            checks,
-            "oracle_sigma_positive",
-            bool(np.all(sigma_vals > 0.0)),
-            "sigma > 0",
-        )
-
-    # --- deterministic synthetic replay ---------------------------------------
-    # Regenerate configured paths from config.resolved.json and compare exported
-    # realized returns and oracle values against their declared target indices.
-    # Model forecasts are not constructed from oracle values.
-    replay_ok = True
-    replay_detail = "not attempted"
-    try:
-        partitions = generate_partitions(
-            resolved["partitions"],
-            resolved["seeds"],
-            **resolved["dgp"],
-            alphas=resolved["alpha_grid"],
-        )
-        dataset_id = resolved.get("dataset_id", "synthetic")
-
-        # Build expected realized return lookup keyed by (series_id, origin, target).
-        expected_returns: dict[tuple[str, int, int], float] = {}
-        expected_oracle: dict[tuple[str, int, int, float], tuple[float, float, float]] = {}
-        for name, path in partitions.items():
-            series_id = f"{dataset_id}_{name}"
-            returns = path.returns
-            for origin in range(returns.size - 1):
-                target = origin + 1
-                expected_returns[(series_id, origin, target)] = float(returns[target])
-                for alpha_index, alpha in enumerate(alpha_grid):
-                    expected_oracle[(series_id, origin, target, float(alpha))] = (
-                        float(path.sigma[target]),
-                        float(path.oracle_var[target, alpha_index]),
-                        float(path.oracle_es[target, alpha_index]),
-                    )
-
-        # Compare forecast realized_return against regenerated path.
-        if not forecasts.empty:
-            mismatches = 0
-            compared = 0
-            for row in forecasts.itertuples(index=False):
-                try:
-                    key = (str(row.series_id), int(row.origin_date), int(row.target_date))
-                except (ValueError, TypeError):
-                    mismatches += 1
-                    continue
-                expected = expected_returns.get(key)
-                if expected is None:
-                    mismatches += 1
-                    continue
-                compared += 1
-                if not np.isclose(float(row.realized_return), expected, rtol=1e-9, atol=1e-12):
-                    mismatches += 1
-            if mismatches > 0 or compared == 0:
-                replay_ok = False
-            replay_detail = f"forecast realized_return mismatches={mismatches} compared={compared}"
-
-        # Compare oracle values against regenerated path at declared target indices.
         if not oracle.empty:
-            oracle_mismatches = 0
-            oracle_compared = 0
-            for row in oracle.itertuples(index=False):
-                try:
-                    key = (
-                        str(row.series_id),
-                        int(row.origin_date),
-                        int(row.target_date),
-                        float(row.alpha),
-                    )
-                except (ValueError, TypeError):
-                    oracle_mismatches += 1
-                    continue
-                expected = expected_oracle.get(key)
-                if expected is None:
-                    oracle_mismatches += 1
-                    continue
-                oracle_compared += 1
-                sigma, oracle_var, oracle_es = expected
-                if not (
-                    np.isclose(float(row.sigma), sigma, rtol=1e-9, atol=1e-12)
-                    and np.isclose(float(row.oracle_var), oracle_var, rtol=1e-9, atol=1e-12)
-                    and np.isclose(float(row.oracle_es), oracle_es, rtol=1e-9, atol=1e-12)
-                ):
-                    oracle_mismatches += 1
-            if oracle_mismatches > 0 or oracle_compared == 0:
-                replay_ok = False
-            replay_detail += f"; oracle mismatches={oracle_mismatches} compared={oracle_compared}"
+            oracle_key = ["series_id", "origin_date", "target_date", "alpha"]
+            oracle_unique = not oracle.duplicated(subset=oracle_key).any()
+            _record(checks, "oracle_keys_unique", oracle_unique, f"key={oracle_key}")
 
-        # Recompute historical forecasts independently (without oracle inputs) and
-        # compare exported var/es to ensure the run used the declared window/timing.
-        if not forecasts.empty and MODEL_HISTORICAL in expected_models:
-            window = resolved["historical_window"]
-            origin_start = max(window, FEATURE_WARMUP - 1)
-            forecast_mismatches = 0
-            forecast_compared = 0
-            for name, path in partitions.items():
-                series_id = f"{dataset_id}_{name}"
-                returns = path.returns
-                features = build_feature_frame(returns)
-                scale_by_origin = {int(r.origin_index): float(r.return_scale) for r in features.itertuples()}
-                subset = forecasts[
-                    (forecasts["series_id"] == series_id)
-                    & (forecasts["model_id"] == MODEL_HISTORICAL)
-                ]
-                for row in subset.itertuples(index=False):
-                    origin = int(row.origin_date)
-                    if origin < origin_start or origin >= returns.size - 1:
-                        forecast_mismatches += 1
-                        continue
-                    trailing = returns[origin - window + 1 : origin + 1]
-                    expected_var, expected_es = historical_var_es(trailing, float(row.alpha))
-                    forecast_compared += 1
-                    if not (
-                        np.isclose(float(row.var), expected_var, rtol=1e-9, atol=1e-12)
-                        and np.isclose(float(row.es), expected_es, rtol=1e-9, atol=1e-12)
-                        and np.isclose(float(row.scale), scale_by_origin.get(origin, np.nan), rtol=1e-9, atol=1e-12)
-                    ):
-                        forecast_mismatches += 1
-            if forecast_mismatches > 0 or forecast_compared == 0:
-                replay_ok = False
-            replay_detail += f"; historical forecast mismatches={forecast_mismatches} compared={forecast_compared}"
+            oracle_numeric = ["alpha", "sigma", "oracle_var", "oracle_es"]
+            oracle_finite = True
+            for col in oracle_numeric:
+                values = pd.to_numeric(oracle[col], errors="coerce").to_numpy(dtype=float)
+                if not np.all(np.isfinite(values)):
+                    oracle_finite = False
+                    break
+            _record(checks, "oracle_values_finite", oracle_finite, f"columns={oracle_numeric}")
 
-        # Recompute GARCH-t forecasts: refit on the train partition (deterministic
-        # arch MLE) and compare exported var/es/scale for garch rows. Model
-        # forecasts use observed returns only; oracle values are never inputs.
-        if not forecasts.empty and MODEL_GARCH_T in expected_models:
-            from .models.garch_t import GarchStudentTModel
+            oracle_var_vals = oracle["oracle_var"].astype(float).to_numpy()
+            oracle_es_vals = oracle["oracle_es"].astype(float).to_numpy()
+            sigma_vals = oracle["sigma"].astype(float).to_numpy()
+            _record(
+                checks,
+                "oracle_signed_ordering",
+                bool(np.all(oracle_es_vals <= oracle_var_vals) and np.all(oracle_var_vals < 0.0)),
+                "oracle_es <= oracle_var < 0",
+            )
+            _record(
+                checks,
+                "oracle_sigma_positive",
+                bool(np.all(sigma_vals > 0.0)),
+                "sigma > 0",
+            )
 
-            garch_model = GarchStudentTModel()
-            garch_model.fit(partitions["train"].returns)
-            garch_mismatches = 0
-            garch_compared = 0
-            for name, path in partitions.items():
-                series_id = f"{dataset_id}_{name}"
-                subset = forecasts[
-                    (forecasts["series_id"] == series_id)
-                    & (forecasts["model_id"] == MODEL_GARCH_T)
-                ]
-                expected_by_key: dict[tuple[int, float], tuple[float, float, float]] = {}
-                for f in garch_model.predict(path.returns, np.asarray(alpha_grid, dtype=float)):
-                    expected_by_key[(f.origin_index, float(f.alpha))] = (f.var, f.es, f.scale)
-                for row in subset.itertuples(index=False):
-                    key = (int(row.origin_date), float(row.alpha))
-                    if key not in expected_by_key:
-                        garch_mismatches += 1
-                        continue
-                    e_var, e_es, e_scale = expected_by_key[key]
-                    garch_compared += 1
-                    if not (
-                        np.isclose(float(row.var), e_var, rtol=1e-7, atol=1e-12)
-                        and np.isclose(float(row.es), e_es, rtol=1e-7, atol=1e-12)
-                        and np.isclose(float(row.scale), e_scale, rtol=1e-7, atol=1e-12)
-                    ):
-                        garch_mismatches += 1
-            if garch_mismatches > 0 or garch_compared == 0:
-                replay_ok = False
-            replay_detail += f"; garch forecast mismatches={garch_mismatches} compared={garch_compared}"
-    except Exception as exc:  # noqa: BLE001 - surface actionable replay failure
-        replay_ok = False
-        replay_detail = f"replay failed: {exc}"
+    # --- re-derive the series and replay --------------------------------------
+    try:
+        sources, partitions = _rebuild_sources(resolved)
+    except ArtifactVerificationError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _record(checks, "series_rebuild", False, f"could not rebuild the run series: {exc}")
+        sources, partitions = {}, None
+    else:
+        _record(
+            checks,
+            "series_rebuild",
+            bool(sources),
+            f"splits={sorted(sources)} rebuilt from {'panel' if real else 'declared DGP'}",
+        )
 
-    _record(checks, "deterministic_synthetic_replay", replay_ok, replay_detail)
+    if sources and not forecasts.empty:
+        _session_chain(checks, forecasts, sources, real)
+        _replay(checks, resolved, forecasts, oracle, sources, partitions, expected_models, alpha_grid, real)
+    elif sources:
+        _record(checks, "replay_possible", False, "no forecast rows to replay")
 
-    passed = all(c["passed"] for c in checks)
+    # Inapplicable checks are reported but never decide the outcome: a missing oracle is
+    # an absence of evidence, not a pass and not a failure.
+    passed = all(check["passed"] for check in checks if check.get("applicable", True))
     return checks, passed

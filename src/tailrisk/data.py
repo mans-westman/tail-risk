@@ -23,6 +23,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -40,11 +41,27 @@ PANEL_COLUMNS = (
     "split",
     "origin_date",
     "target_date",
+    "origin_return",
     "realized_return",
     "origin_position",
     "prior_returns",
     "is_scored",
     "spans_long_gap",
+)
+
+# Columns a consumer needs to rebuild a split's return array without guessing. The
+# origin return is carried explicitly: without it the array would start one session
+# late and every window would be shifted.
+REQUIRED_PANEL_COLUMNS = (
+    "series_id",
+    "split",
+    "origin_date",
+    "target_date",
+    "origin_return",
+    "realized_return",
+    "origin_position",
+    "prior_returns",
+    "is_scored",
 )
 
 RETURN_UNITS = {"decimal_log": 1.0, "percent_log": 0.01}
@@ -361,6 +378,7 @@ def build_panel(
                     "split": split,
                     "origin_date": frame["session_date"].iloc[origin].strftime("%Y-%m-%d"),
                     "target_date": frame["session_date"].iloc[target].strftime("%Y-%m-%d"),
+                    "origin_return": float(frame["return"].iloc[origin]),
                     "realized_return": float(frame["return"].iloc[target]),
                     "origin_position": int(origin - start),
                     "prior_returns": int(prior),
@@ -651,6 +669,122 @@ def ingest(
         provider_meta=findings.get("provider_meta"),
     )
     return panel, audit
+
+
+
+# ---------------------------------------------------------------------------- consumption
+
+
+@dataclass(frozen=True)
+class PanelSplit:
+    """One split's contiguous return history, with dates aligned to array positions.
+
+    ``returns[i]`` is the return realised at ``origin_dates[i]``; the target of origin
+    index ``i`` is ``returns[i + 1]`` on ``target_dates[i]``. ``scored_origin_indices``
+    are the origins whose target lies in this split and whose trailing window is
+    complete, so a model never scores a row the panel marked as warm-up.
+    """
+
+    split: str
+    series_id: str
+    returns: np.ndarray
+    origin_dates: tuple[str, ...]
+    target_dates: tuple[str, ...]
+    scored_origin_indices: tuple[int, ...]
+    context_returns: int
+
+    def __post_init__(self) -> None:
+        if len(self.origin_dates) != self.returns.size:
+            raise DataError(f"{self.split}: origin dates and returns are misaligned")
+        if len(self.target_dates) != self.returns.size - 1:
+            raise DataError(f"{self.split}: target dates and returns are misaligned")
+
+
+def load_panel(path: str | Path) -> dict[str, PanelSplit]:
+    """Rebuild per-split return arrays from a panel, re-verifying its invariants.
+
+    The panel is an input that could be edited, so nothing is taken on trust: session
+    chaining, return alignment, position ordering and the scored-origin set are all
+    re-checked here, and a violation is an error rather than a quietly shifted window.
+    """
+    frame = pd.read_csv(path)
+    missing = [column for column in REQUIRED_PANEL_COLUMNS if column not in frame.columns]
+    if missing:
+        raise DataError(f"panel is missing columns: {missing}")
+    if frame.empty:
+        raise DataError("panel contains no rows")
+
+    frame = frame.copy()
+    frame["origin_position"] = pd.to_numeric(frame["origin_position"], errors="coerce")
+    if frame["origin_position"].isna().any():
+        raise DataError("panel has unparseable origin positions")
+    frame["origin_position"] = frame["origin_position"].astype(int)
+    for column in ("origin_return", "realized_return"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    for column in ("origin_date", "target_date"):
+        frame[column] = frame[column].astype(str)
+    frame["is_scored"] = frame["is_scored"].astype(str).str.lower().isin(("true", "1"))
+
+    splits: dict[str, PanelSplit] = {}
+    for split, block in frame.groupby("split", sort=False):
+        block = block.sort_values("origin_position")
+        positions = block["origin_position"].to_numpy()
+        if positions.size and positions[0] != 0:
+            raise DataError(f"{split}: panel does not start at origin position 0")
+        if not np.array_equal(positions, np.arange(positions.size)):
+            raise DataError(f"{split}: origin positions are not contiguous from 0")
+
+        origin_dates = block["origin_date"].tolist() + [block["target_date"].iloc[-1]]
+        target_dates = block["target_date"].tolist()
+        for index, target in enumerate(target_dates):
+            if target != origin_dates[index + 1]:
+                raise DataError(
+                    f"{split}: session chain breaks between {origin_dates[index]} and {target}"
+                )
+
+        realized = block["realized_return"].to_numpy(dtype=float)
+        origin_returns = block["origin_return"].to_numpy(dtype=float)
+        # One row's realised return is the next row's origin return. This is the only
+        # non-circular way to state that the columns describe one continuous history:
+        # comparing the array against the column it was built from would always agree.
+        if realized.size > 1 and not np.array_equal(realized[:-1], origin_returns[1:]):
+            offenders = np.flatnonzero(realized[:-1] != origin_returns[1:])[:3]
+            raise DataError(
+                f"{split}: realised return and next origin return disagree at positions {offenders.tolist()}"
+            )
+        returns = np.concatenate(([origin_returns[0]], realized))
+        if not np.all(np.isfinite(returns)):
+            raise DataError(f"{split}: panel contains non-finite returns")
+
+        scored = block.loc[block["is_scored"], "origin_position"].to_numpy(dtype=int)
+        prior = block.loc[block["is_scored"], "prior_returns"].to_numpy(dtype=float)
+        if scored.size and np.any(prior < 1):
+            raise DataError(f"{split}: scored origins without preceding history")
+        if scored.size and not np.all(np.diff(scored) >= 1):
+            raise DataError(f"{split}: scored origins are not strictly increasing")
+        if scored.size and (scored[0] < prior[0]):
+            raise DataError(f"{split}: scored origin precedes its declared warm-up")
+
+        series_ids = set(block["series_id"].astype(str))
+        if len(series_ids) != 1:
+            raise DataError(f"{split}: panel mixes series ids {sorted(series_ids)}")
+
+        splits[split] = PanelSplit(
+            split=str(split),
+            series_id=series_ids.pop(),
+            returns=returns,
+            origin_dates=tuple(origin_dates),
+            target_dates=tuple(target_dates),
+            scored_origin_indices=tuple(int(value) for value in scored),
+            context_returns=int(block["prior_returns"].min()),
+        )
+
+    expected = [name for name in SPLIT_ORDER if name in splits]
+    if not expected:
+        raise DataError("panel contains no recognised splits")
+    if "train" not in splits:
+        raise DataError("panel has no train split; model fitting requires one")
+    return splits
 
 
 def write_dataset(panel: pd.DataFrame, audit: dict[str, Any], out_dir: str | Path) -> dict[str, str]:

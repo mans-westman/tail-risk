@@ -76,12 +76,20 @@ def test_smoke_run_and_verify(tmp_path):
 
 
 @pytest.mark.integration
-def test_run_rejects_bad_config(tmp_path):
+def test_run_rejects_bad_config(tmp_path, capsys):
+    """An unusable config is a reported failure, not a traceback.
+
+    ``run`` used to raise; it now returns exit code 2 with a named reason, matching
+    ``ingest``/``evaluate`` so a caller never has to parse a stack trace to find out
+    why nothing was produced.
+    """
     config = {"schema_version": 1, "dgp": {"innovation": "unknown"}}
     config_path = tmp_path / "bad.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
-    with pytest.raises(ValueError):
-        cmd_run(str(config_path), str(tmp_path / "out"))
+    assert cmd_run(str(config_path), str(tmp_path / "out")) == 2
+    captured = capsys.readouterr()
+    assert "dgp.innovation" in captured.err
+    assert not (tmp_path / "out" / "forecasts.csv").exists()
 
 
 @pytest.mark.integration
