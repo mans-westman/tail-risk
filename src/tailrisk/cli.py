@@ -332,8 +332,12 @@ def _read_run_csv(directory: Path, name: str) -> pd.DataFrame:
 
 
 def cmd_evaluate(run_dir: str) -> int:
-    """Score saved forecasts on original-unit returns; writes metrics.csv only."""
-    from .evaluation import evaluate_forecasts
+    """Score saved forecasts on original-unit returns; writes metrics.csv only.
+
+    The configured model roster is read from config.resolved.json, so a model that
+    produced no rows fails evaluation instead of quietly shrinking the comparison.
+    """
+    from .evaluation import EvaluationError, evaluate_forecasts
 
     directory = Path(run_dir)
     if not directory.exists():
@@ -348,7 +352,13 @@ def cmd_evaluate(run_dir: str) -> int:
         return 2
 
     dataset_id = str(resolved.get("dataset_id", "synthetic"))
-    metrics = evaluate_forecasts(forecasts, oracle, dataset_id)
+    configured = resolved.get("models")
+    roster = [str(model) for model in configured] if configured else None
+    try:
+        metrics = evaluate_forecasts(forecasts, oracle, dataset_id, expected_models=roster)
+    except EvaluationError as exc:
+        print(f"evaluation failed: {exc}", file=sys.stderr)
+        return 2
     if metrics.empty:
         print("evaluation produced no metrics: no 'ok' forecast rows", file=sys.stderr)
         return 1

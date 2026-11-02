@@ -155,6 +155,26 @@ class GroupMetrics:
     es_rmse_vs_oracle: float
 
 
+class EvaluationError(ValueError):
+    """Raised when saved forecasts cannot be scored as a valid comparison."""
+
+
+def _chronology_key(values: pd.Series) -> pd.Series:
+    """Comparable numeric keys for identifiers that must be ordered in time."""
+    raw = values.astype(str)
+    numeric = pd.to_numeric(raw, errors="coerce")
+    if numeric.notna().all():
+        return numeric.astype(float)
+    parsed = pd.to_datetime(raw, errors="coerce", format="mixed")
+    if parsed.notna().all():
+        return parsed.astype("int64").astype(float)
+    bad = raw[parsed.isna()].head(3).tolist()
+    raise EvaluationError(
+        "identifiers are neither numeric nor parseable dates: "
+        f"{bad}; evaluation requires a chronological order"
+    )
+
+
 def chronological_ranks(values: pd.Series) -> pd.Series:
     """Dense integer ranks that order origin identifiers chronologically.
 
@@ -164,21 +184,7 @@ def chronological_ranks(values: pd.Series) -> pd.Series:
     Numeric ids are ranked numerically, date-like ids by parsed timestamp, and
     anything else raises instead of falling back to an arbitrary order.
     """
-    raw = values.astype(str)
-    numeric = pd.to_numeric(raw, errors="coerce")
-    if numeric.notna().all():
-        key = numeric.astype(float)
-    else:
-        parsed = pd.to_datetime(raw, errors="coerce", format="mixed")
-        if parsed.notna().all():
-            key = parsed.astype("int64").astype(float)
-        else:
-            bad = raw[parsed.isna()].head(3).tolist()
-            raise ValueError(
-                "origin identifiers are neither numeric nor parseable dates: "
-                f"{bad}; evaluation requires a chronological order"
-            )
-    return key.rank(method="dense").astype(int)
+    return _chronology_key(values).rank(method="dense").astype(int)
 
 
 def _split_from_series(dataset_id: str, series_id: str) -> str:
@@ -192,10 +198,60 @@ def _empty_metrics() -> pd.DataFrame:
     return pd.DataFrame(columns=METRICS_COLUMNS)
 
 
+def _validate_forecast_rows(df: pd.DataFrame) -> None:
+    """Reject saved forecasts that cannot support an ordered, keyed comparison."""
+    required = {"series_id", "model_id", "alpha", "origin_date", "var", "es", "status"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise EvaluationError(f"forecasts are missing required columns: {missing}")
+
+    key = ["series_id", "model_id", "alpha", "origin_date"]
+    duplicated = df.duplicated(subset=key, keep=False)
+    if duplicated.any():
+        examples = df.loc[duplicated, key].head(3).to_dict("records")
+        raise EvaluationError(
+            f"{int(duplicated.sum())} duplicate (series, model, alpha, origin) rows, "
+            f"e.g. {examples}; forecasts must hold one row per key"
+        )
+
+    if "target_date" not in df.columns:
+        return
+    for series_id, group in df.groupby("series_id", sort=False):
+        has_target = group["target_date"].notna()
+        if not has_target.any():
+            continue
+        origins = group["origin_date"].astype(str)
+        targets = group.loc[has_target, "target_date"].astype(str)
+        try:
+            keys = _chronology_key(pd.concat([origins, targets], ignore_index=True))
+        except EvaluationError:
+            # Unparseable identifiers: skip ordering checks rather than guess an order.
+            continue
+        origin_keys = keys.iloc[: len(origins)].to_numpy()
+        target_keys = keys.iloc[len(origins):].to_numpy()
+        flagged = has_target.to_numpy()
+        if np.any(target_keys <= origin_keys[flagged]):
+            raise EvaluationError(
+                f"target_date must follow origin_date for series {series_id!r}; "
+                "check forecast assembly before scoring"
+            )
+        probe = group.loc[has_target, ["model_id", "alpha"]].copy()
+        probe["_o"] = origin_keys[flagged]
+        probe["_t"] = target_keys
+        for (model_id, alpha), cell in probe.groupby(["model_id", "alpha"]):
+            ordered = cell["_t"].to_numpy()[np.argsort(cell["_o"].to_numpy())]
+            if ordered.size > 1 and not np.all(np.diff(ordered) > 0):
+                raise EvaluationError(
+                    f"target dates do not advance with origins for series {series_id!r}, "
+                    f"model {model_id!r}, alpha {alpha}"
+                )
+
+
 def evaluate_forecasts(
     forecasts: pd.DataFrame,
     oracle: pd.DataFrame,
     dataset_id: str,
+    expected_models: list[str] | None = None,
 ) -> pd.DataFrame:
     """Per (series, model, alpha) evaluation on a common scoring mask.
 
@@ -208,6 +264,11 @@ def evaluate_forecasts(
     visible; a model with no overlap yields a row with n=0 and NaN metrics
     instead of disappearing.
 
+    `expected_models` is the configured roster. A configured model that appears in
+    no row at all is a hard error, because the comparison would silently be partial.
+    A configured model missing from one cell empties that cell, matching the
+    handling of a model whose rows all failed.
+
     Oracle comparisons join on (series_id, origin_date, alpha) over the same
     masked rows and are implementation checks, not skill evidence.
     """
@@ -215,6 +276,7 @@ def evaluate_forecasts(
         return _empty_metrics()
 
     df = forecasts.copy()
+    _validate_forecast_rows(df)
     df["origin_date"] = df["origin_date"].astype(str)
     df["_chrono"] = df.groupby("series_id", sort=False)["origin_date"].transform(chronological_ranks)
     df["alpha"] = df["alpha"].astype(float)
@@ -236,6 +298,14 @@ def evaluate_forecasts(
     else:
         oracle_index = None
 
+    roster = list(dict.fromkeys(expected_models or ()))
+    absent = [model for model in roster if model not in set(df["model_id"])]
+    if absent:
+        raise EvaluationError(
+            f"configured model(s) {absent} emitted no forecast rows; "
+            f"present: {sorted(set(df['model_id']))}. Scoring would compare against a partial roster"
+        )
+
     # Common scoring mask: intersection of scorable origins across every model that emitted
     # rows for the cell. A model with no scorable row contributes an empty set, which empties
     # the cell instead of letting the remaining models be scored alone (guide section 7.3).
@@ -249,8 +319,16 @@ def evaluate_forecasts(
 
     records: list[dict] = []
     # Iterate over every emitted (series, alpha, model) cell, not only ok rows, so a
-    # model that failed outright is reported with n=0 instead of vanishing.
-    cell_keys = df.groupby(["series_id", "alpha", "model_id"]).size().index
+    # model that failed outright is reported with n=0 instead of vanishing. A configured
+    # model missing from a cell is added explicitly and empties that cell.
+    cell_keys = list(df.groupby(["series_id", "alpha", "model_id"]).size().index)
+    for (series_id, alpha), cell in df.groupby(["series_id", "alpha"]):
+        present = set(cell["model_id"])
+        for model_id in roster:
+            if model_id not in present:
+                cell_keys.append((series_id, alpha, model_id))
+                masks[(series_id, alpha)] = set()
+
     for series_id, alpha, model_id in cell_keys:
         available = df[
             (df["series_id"] == series_id)

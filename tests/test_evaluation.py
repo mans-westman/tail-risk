@@ -10,7 +10,7 @@ from tailrisk.cli import cmd_evaluate, cmd_report, cmd_run, cmd_verify
 from tailrisk.evaluation import evaluate_forecasts, fz0_loss, quantile_loss
 
 
-def _make_run(tmp_path):
+def _make_run(tmp_path, models=None):
     config = {
         "schema_version": 1,
         "run_id": "eval_report_test",
@@ -21,6 +21,8 @@ def _make_run(tmp_path):
         "alpha_grid": [0.025],
         "historical_window": 50,
     }
+    if models:
+        config["models"] = models
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
     out_dir = tmp_path / "out"
@@ -352,3 +354,106 @@ def test_evaluate_reports_models_that_failed_entirely():
     assert metrics.loc["model_a", "n"] == 0
     assert metrics.loc["model_a", "n_dropped_by_mask"] == 3
     assert metrics.loc["model_a", "n_failed_rows"] == 0
+
+
+def _frame(rows: list[dict]) -> pd.DataFrame:
+    defaults = {"alpha": 0.025, "var": -0.02, "es": -0.03, "scale": 0.01, "status": "ok"}
+    return pd.DataFrame([{**defaults, **row} for row in rows])
+
+
+def test_evaluate_rejects_duplicate_forecast_keys():
+    from tailrisk.evaluation import EvaluationError
+
+    forecasts = _frame(
+        [
+            {"series_id": "ds_test", "model_id": "m", "origin_date": 0, "target_date": 1, "realized_return": 0.01},
+            {"series_id": "ds_test", "model_id": "m", "origin_date": 0, "target_date": 1, "realized_return": 0.01},
+        ]
+    )
+    with pytest.raises(EvaluationError, match="duplicate"):
+        evaluate_forecasts(forecasts, pd.DataFrame(), "ds")
+
+
+def test_evaluate_rejects_target_not_after_origin():
+    from tailrisk.evaluation import EvaluationError
+
+    forecasts = _frame(
+        [
+            {"series_id": "ds_test", "model_id": "m", "origin_date": 5, "target_date": 5, "realized_return": 0.01},
+        ]
+    )
+    with pytest.raises(EvaluationError, match="must follow origin_date"):
+        evaluate_forecasts(forecasts, pd.DataFrame(), "ds")
+
+
+def test_evaluate_rejects_targets_that_do_not_advance():
+    from tailrisk.evaluation import EvaluationError
+
+    forecasts = _frame(
+        [
+            {"series_id": "ds_test", "model_id": "m", "origin_date": 0, "target_date": 5, "realized_return": 0.01},
+            {"series_id": "ds_test", "model_id": "m", "origin_date": 1, "target_date": 3, "realized_return": 0.01},
+            {"series_id": "ds_test", "model_id": "m", "origin_date": 2, "target_date": 4, "realized_return": 0.01},
+        ]
+    )
+    with pytest.raises(EvaluationError, match="do not advance"):
+        evaluate_forecasts(forecasts, pd.DataFrame(), "ds")
+
+
+def test_evaluate_errors_when_a_configured_model_emitted_nothing():
+    from tailrisk.evaluation import EvaluationError
+
+    forecasts = _frame(
+        [
+            {"series_id": "ds_test", "model_id": "model_a", "origin_date": i, "target_date": i + 1, "realized_return": 0.01}
+            for i in range(3)
+        ]
+    )
+    with pytest.raises(EvaluationError, match="emitted no forecast rows"):
+        evaluate_forecasts(
+            forecasts, pd.DataFrame(), "ds", expected_models=["model_a", "model_b"]
+        )
+
+
+def test_evaluate_reports_configured_model_missing_from_one_cell():
+    forecasts = _frame(
+        [
+            {"series_id": "ds_test", "model_id": "model_a", "origin_date": i, "target_date": i + 1,
+             "realized_return": 0.01, "alpha": 0.025}
+            for i in range(3)
+        ]
+        + [
+            {"series_id": "ds_test", "model_id": "model_a", "origin_date": i, "target_date": i + 1,
+             "realized_return": 0.01, "alpha": 0.05}
+            for i in range(3)
+        ]
+        + [
+            {"series_id": "ds_test", "model_id": "model_b", "origin_date": i, "target_date": i + 1,
+             "realized_return": 0.01, "alpha": 0.025}
+            for i in range(3)
+        ]
+    )
+    metrics = evaluate_forecasts(
+        forecasts, pd.DataFrame(), "ds", expected_models=["model_a", "model_b"]
+    ).set_index(["alpha", "model_id"])
+
+    # alpha=0.025 has both models: scored normally on three shared origins.
+    assert metrics.loc[(0.025, "model_a"), "n"] == 3
+    assert metrics.loc[(0.025, "model_b"), "n"] == 3
+
+    # alpha=0.05 is missing model_b: the cell is reported empty for both, not scored
+    # on model_a alone.
+    assert metrics.loc[(0.05, "model_b"), "n"] == 0
+    assert metrics.loc[(0.05, "model_a"), "n"] == 0
+    assert metrics.loc[(0.05, "model_a"), "n_dropped_by_mask"] == 3
+    assert np.isnan(metrics.loc[(0.05, "model_a"), "mean_fz0"])
+
+
+def test_evaluate_cli_fails_when_a_configured_model_wrote_nothing(tmp_path):
+    out_dir = _make_run(tmp_path, models=["historical_simulation", "garch_student_t"])
+    forecasts_path = out_dir / "forecasts.csv"
+    forecasts = pd.read_csv(forecasts_path)
+    forecasts[forecasts["model_id"] == "garch_student_t"].to_csv(forecasts_path, index=False)
+
+    assert cmd_evaluate(str(out_dir)) == 2
+    assert not (out_dir / "metrics.csv").exists()
