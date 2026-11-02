@@ -15,6 +15,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "arch>=8"]
+# Optional: exchange-session cross-check for the market-data adapter. `ingest` runs
+# without it and records the check as skipped rather than guessing a calendar.
+data = ["pandas_market_calendars>=5"]
 
 [project.scripts]
 tailrisk = "tailrisk.cli:main"

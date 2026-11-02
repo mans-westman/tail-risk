@@ -14,7 +14,7 @@ tailrisk/                    # run commands here; Git root
   PROJECT_GUIDE.md           # scientific specification and staged plan (stable reference)
   AGENTS.md                  # working rules, verification standards, Git guidance
   LITERATURE_REVIEW.md       # bounded literature/novelty audit
-  configs/                   # JSON run configurations
+  configs/                   # JSON run and ingest configurations
   src/tailrisk/              # package and CLI
   tests/                     # numerical, timing, mask, and diagnostic checks
   outputs/<run_id>/          # generated runs (ignored except its README)
@@ -40,11 +40,16 @@ python -m tailrisk run      --config configs/smoke.json --output outputs/my-run
 python -m tailrisk verify   --run outputs/my-run
 python -m tailrisk evaluate --run outputs/my-run
 python -m tailrisk report   --run outputs/my-run
+python -m tailrisk ingest   --config configs/sp500.json --out data/sp500
 ```
 
 `run` simulates, builds causal features, and writes forecasts. `verify` re-derives the saved artifacts independently (including deterministic replay) and writes `artifact_verification.json`; it does not modify `checks.json`. `evaluate` scores the saved forecasts and writes `metrics.csv`. `report` assembles `report.md` from existing artifacts only.
 
 Use a new output directory for every run; the CLI does not protect existing outputs from being overwritten.
+
+`ingest` is the optional market-data adapter; it is never invoked by `run`, so the package stays usable offline. It obtains one dated snapshot (`^GSPC` price-index closes by default), validates it, and writes `panel.csv` plus `data_audit.json`. Add `--from-raw` to re-derive from a saved payload without downloading, `--reference` to cross-check a return file whose units are declared (never inferred), and `--keep-raw` to store the payload, its SHA-256, and retrieval time. Market data is not redistributed: `data/` is ignored, so acquisition is reproducible from the config rather than from a committed cache.
+
+The panel is one causal table per split. Splits are assigned by **target date**, and validation/test keep trailing returns from the preceding period, so their opening sessions still have a full feature and historical window instead of being cropped. A split that cannot be given that context fails loudly. `is_scored` marks rows whose target lies in the split and whose origin has the required history; `prior_returns` and `origin_position` make the warm-up auditable, and `spans_long_gap` flags returns spanning a closure.
 
 ## What the artifacts mean
 

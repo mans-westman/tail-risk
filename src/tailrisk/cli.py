@@ -378,6 +378,99 @@ def _read_json_artifact(path: Path) -> dict:
         raise ArtifactVerificationError(f"malformed JSON in {path}: {exc}") from exc
 
 
+def cmd_ingest(
+    config_path: str,
+    out_dir: str,
+    *,
+    from_raw: str | None = None,
+    keep_raw: str | None = None,
+    reference: str | None = None,
+    reference_units: str = "percent_log",
+) -> int:
+    """Obtain one market snapshot, validate it, and write a causal panel plus audit.
+
+    This is the optional market-data adapter. Nothing in `run` downloads data; the
+    command fails loudly rather than substituting a different instrument or window.
+    """
+    from .data import (
+        DataError,
+        ingest,
+        load_ingest_config,
+        normalise_returns,
+        write_dataset,
+    )
+
+    try:
+        config = load_ingest_config(config_path)
+    except (DataError, OSError, json.JSONDecodeError) as exc:
+        print(f"ingest failed: {exc}", file=sys.stderr)
+        return 2
+
+    reference_returns = None
+    if reference is not None:
+        try:
+            # Read dates as strings: an integer-looking 19900103 would otherwise be
+            # inferred as int64 and then parsed by pandas as epoch nanoseconds (1970).
+            raw = pd.read_csv(
+                reference,
+                comment="#",
+                sep=r"\s+",
+                header=None,
+                names=["session_date", "return"],
+                dtype={"session_date": str},
+            )
+            reference_returns = normalise_returns(raw, units=reference_units)
+        except (DataError, OSError, ValueError) as exc:
+            print(f"ingest failed: reference file unusable: {exc}", file=sys.stderr)
+            return 2
+
+    required = max(FEATURE_WARMUP, int(config.get("historical_window", 0)))
+    if int(config["required_context"]) < required:
+        print(
+            f"ingest failed: required_context={config['required_context']} is below the "
+            f"declared warm-up {required} (FEATURE_WARMUP={FEATURE_WARMUP}, "
+            f"historical_window={config.get('historical_window')})",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        panel, audit = ingest(
+            config,
+            from_raw=from_raw,
+            raw_cache=keep_raw,
+            reference_returns=reference_returns,
+        )
+    except (DataError, OSError, json.JSONDecodeError) as exc:
+        print(f"ingest failed: {exc}", file=sys.stderr)
+        return 2
+
+    paths = write_dataset(panel, audit, out_dir)
+    scored = panel.loc[panel["is_scored"]]
+    print(f"ingest complete -> {paths['panel']}")
+    print(
+        f"  prices: {audit['coverage']['prices']} "
+        f"({audit['coverage']['first_session']} -> {audit['coverage']['last_session']})"
+    )
+    print(f"  returns: {audit['coverage']['returns']} decimal log returns")
+    for split, info in audit["splits"]["splits"].items():
+        print(
+            f"  {split}: {info['targets']} targets "
+            f"({info['first_target_date']} -> {info['last_target_date']}), "
+            f"{info['scored_origins']} scored, context {info['context_returns_attached']} returns"
+        )
+    print(f"  scored rows spanning a long gap: {int(scored['spans_long_gap'].sum())}")
+    if audit["cross_check"] is not None:
+        cross = audit["cross_check"]
+        print(
+            f"  cross-check: {cross['sessions_compared']} sessions, "
+            f"max |diff| {cross['max_abs_difference_percent_points']:.3e} pp, "
+            f"within tolerance={cross['within_tolerance']}"
+        )
+    print(f"  audit -> {paths['audit']}; raw sha256 {audit['source']['raw_sha256']}")
+    return 0
+
+
 def cmd_report(run_dir: str) -> int:
     """Assemble a concise report.md from existing artifacts (no recomputation)."""
     directory = Path(run_dir)
@@ -510,6 +603,22 @@ def main(argv: list[str] | None = None) -> int:
     report_p = sub.add_parser("report", help="write report.md from existing artifacts")
     report_p.add_argument("--run", required=True, help="run output directory")
 
+    ingest_p = sub.add_parser(
+        "ingest",
+        help="obtain and validate one market snapshot; writes panel.csv and data_audit.json",
+    )
+    ingest_p.add_argument("--config", required=True, help="path to the JSON ingest config")
+    ingest_p.add_argument("--out", required=True, help="output directory for panel and audit")
+    ingest_p.add_argument("--from-raw", default=None, help="reuse a saved provider payload instead of downloading")
+    ingest_p.add_argument("--keep-raw", default=None, help="write the downloaded payload to this path")
+    ingest_p.add_argument("--reference", default=None, help="optional return file for a transformation cross-check")
+    ingest_p.add_argument(
+        "--reference-units",
+        default="percent_log",
+        choices=["percent_log", "decimal_log"],
+        help="declared units of the reference file; never inferred from magnitude",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "run":
         return cmd_run(args.config, args.output)
@@ -519,6 +628,15 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_evaluate(args.run)
     if args.command == "report":
         return cmd_report(args.run)
+    if args.command == "ingest":
+        return cmd_ingest(
+            args.config,
+            args.out,
+            from_raw=args.from_raw,
+            keep_raw=args.keep_raw,
+            reference=args.reference,
+            reference_units=args.reference_units,
+        )
     parser.error(f"unknown command: {args.command}")
     return 2
 
