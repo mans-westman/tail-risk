@@ -14,6 +14,7 @@ METRICS_COLUMNS = [
     "kupiec_lr_uc", "kupiec_p_uc",
     "christoffersen_lr_ind", "christoffersen_p_ind",
     "christoffersen_lr_cc", "christoffersen_p_cc",
+    "n_transitions", "n_chain_breaks",
     "n_oracle_matched", "var_mae_vs_oracle", "var_rmse_vs_oracle",
     "es_mae_vs_oracle", "es_rmse_vs_oracle",
 ]
@@ -42,15 +43,29 @@ def _xlogy(count: int, probability: float) -> float:
     return float(count) * float(np.log(probability))
 
 
-def coverage_diagnostics(exceedance: np.ndarray, alpha: float) -> dict:
+def coverage_diagnostics(
+    exceedance: np.ndarray,
+    alpha: float,
+    consecutive: np.ndarray | None = None,
+) -> dict:
     """Kupiec (unconditional coverage) and Christoffersen (independence) LR tests.
 
-    Input is the ordered hit sequence H_t = 1{Y_t <= v_t}. Tests are the standard
-    likelihood-ratio forms; degrees of freedom are 1 (UC), 1 (independence) and 2
-    (conditional coverage). Undefined cases return NaN rather than a substituted
-    number: independence is undefined when either transition row is empty (this
-    includes zero exceedances and all-exceedance samples), and conditional coverage
-    is undefined whenever independence is.
+    `exceedance` is the hit sequence H_t = 1{Y_t <= v_t} in chronological order.
+    `consecutive` is an optional boolean array of length n-1 marking pairs of
+    adjacent observations that are consecutive sessions. A False entry means the
+    scoring mask or a data gap skipped sessions, so that pair is not a transition
+    and must not enter the Markov likelihood; it defaults to all-consecutive.
+
+    Degrees of freedom are 1 (UC), 1 (independence) and 2 (conditional coverage).
+    The independence null is a first-order chain evaluated over its T transitions,
+    so the pooled hit probability is (n01 + n11) / T. Dividing by n instead of T
+    is a common slip and is wrong: n counts observations, the likelihood product
+    runs over transition pairs.
+
+    Undefined cases return NaN rather than a substituted number: independence is
+    undefined when T == 0 or when either transition row is empty (this includes
+    zero exceedances and all-exceedance samples), and conditional coverage is
+    undefined whenever independence is.
 
     Guide section 7.2 permits these diagnostics only through a checked
     implementation; sparse counts are reported explicitly, not smoothed.
@@ -71,18 +86,31 @@ def coverage_diagnostics(exceedance: np.ndarray, alpha: float) -> dict:
     lr_uc = max(0.0, -2.0 * (null_ll - observed_ll))
     p_uc = float(stats.chi2.sf(lr_uc, df=1))
 
-    # Transition counts for the first-order Markov alternative.
-    prev, curr = hits[:-1], hits[1:]
+    # Transition counts for the first-order Markov alternative, restricted to pairs
+    # that are genuinely consecutive sessions.
+    if consecutive is None:
+        adjacent = np.ones(max(n - 1, 0), dtype=bool)
+    else:
+        adjacent = np.asarray(consecutive, dtype=bool).ravel()
+        if adjacent.size != max(n - 1, 0):
+            raise ValueError(
+                f"consecutive mask has length {adjacent.size}, expected {max(n - 1, 0)}"
+            )
+    prev = hits[:-1][adjacent]
+    curr = hits[1:][adjacent]
+    n_transitions = int(prev.size)
+    n_chain_breaks = int((~adjacent).sum())
+
     n00 = int(np.sum(~prev & ~curr))
     n01 = int(np.sum(~prev & curr))
     n10 = int(np.sum(prev & ~curr))
     n11 = int(np.sum(prev & curr))
 
     lr_ind = p_ind = lr_cc = p_cc = float("nan")
-    if (n00 + n01) > 0 and (n10 + n11) > 0:
+    if n_transitions > 0 and (n00 + n01) > 0 and (n10 + n11) > 0:
         pi01 = n01 / (n00 + n01)
         pi11 = n11 / (n10 + n11)
-        pi = (n01 + n11) / n
+        pi = (n01 + n11) / n_transitions
         alt_ll = (
             _xlogy(n00, 1.0 - pi01) + _xlogy(n01, pi01)
             + _xlogy(n10, 1.0 - pi11) + _xlogy(n11, pi11)
@@ -105,6 +133,7 @@ def coverage_diagnostics(exceedance: np.ndarray, alpha: float) -> dict:
         "christoffersen_lr_cc": float(lr_cc),
         "christoffersen_p_cc": float(p_cc),
         "n00": n00, "n01": n01, "n10": n10, "n11": n11,
+        "n_transitions": n_transitions, "n_chain_breaks": n_chain_breaks,
     }
 
 
@@ -124,6 +153,32 @@ class GroupMetrics:
     var_rmse_vs_oracle: float
     es_mae_vs_oracle: float
     es_rmse_vs_oracle: float
+
+
+def chronological_ranks(values: pd.Series) -> pd.Series:
+    """Dense integer ranks that order origin identifiers chronologically.
+
+    String identifiers must never be sorted as strings: "100" < "62", so a
+    lexicographic sort scrambles any sequence whose ids have mixed digit counts,
+    which silently corrupts the transition order behind the independence test.
+    Numeric ids are ranked numerically, date-like ids by parsed timestamp, and
+    anything else raises instead of falling back to an arbitrary order.
+    """
+    raw = values.astype(str)
+    numeric = pd.to_numeric(raw, errors="coerce")
+    if numeric.notna().all():
+        key = numeric.astype(float)
+    else:
+        parsed = pd.to_datetime(raw, errors="coerce", format="mixed")
+        if parsed.notna().all():
+            key = parsed.astype("int64").astype(float)
+        else:
+            bad = raw[parsed.isna()].head(3).tolist()
+            raise ValueError(
+                "origin identifiers are neither numeric nor parseable dates: "
+                f"{bad}; evaluation requires a chronological order"
+            )
+    return key.rank(method="dense").astype(int)
 
 
 def _split_from_series(dataset_id: str, series_id: str) -> str:
@@ -161,6 +216,7 @@ def evaluate_forecasts(
 
     df = forecasts.copy()
     df["origin_date"] = df["origin_date"].astype(str)
+    df["_chrono"] = df.groupby("series_id", sort=False)["origin_date"].transform(chronological_ranks)
     df["alpha"] = df["alpha"].astype(float)
     for column in ("var", "es", "realized_return"):
         df[column] = pd.to_numeric(df[column], errors="coerce")
@@ -232,6 +288,8 @@ def evaluate_forecasts(
             "christoffersen_p_ind": float("nan"),
             "christoffersen_lr_cc": float("nan"),
             "christoffersen_p_cc": float("nan"),
+            "n_transitions": 0,
+            "n_chain_breaks": 0,
             "n_oracle_matched": 0,
             "var_mae_vs_oracle": float("nan"),
             "var_rmse_vs_oracle": float("nan"),
@@ -243,14 +301,20 @@ def evaluate_forecasts(
             records.append(record)
             continue
 
-        scored = scored.sort_values("origin_date")
+        scored = scored.sort_values("_chrono")
         y = scored["realized_return"].to_numpy(dtype=float)
         v = scored["var"].to_numpy(dtype=float)
         e = scored["es"].to_numpy(dtype=float)
 
+        # A pair counts as a Markov transition only when the two origins are
+        # consecutive sessions in the series' observed sequence; mask gaps and data
+        # gaps break the chain instead of joining non-adjacent days.
+        chrono = scored["_chrono"].to_numpy(dtype=int)
+        consecutive = np.diff(chrono) == 1
+
         fz0 = np.array([fz0_loss(yi, vi, ei, alpha) for yi, vi, ei in zip(y, v, e)])
         qloss = np.array([quantile_loss(yi, vi, alpha) for yi, vi in zip(y, v)])
-        diagnostics = coverage_diagnostics(y <= v, float(alpha))
+        diagnostics = coverage_diagnostics(y <= v, float(alpha), consecutive)
 
         record.update(
             {
@@ -265,6 +329,8 @@ def evaluate_forecasts(
                 "christoffersen_p_ind": diagnostics["christoffersen_p_ind"],
                 "christoffersen_lr_cc": diagnostics["christoffersen_lr_cc"],
                 "christoffersen_p_cc": diagnostics["christoffersen_p_cc"],
+                "n_transitions": diagnostics["n_transitions"],
+                "n_chain_breaks": diagnostics["n_chain_breaks"],
             }
         )
 

@@ -113,19 +113,65 @@ def _hits_with(n: int, positions: list[int]) -> np.ndarray:
 
 
 def test_coverage_diagnostics_match_independent_likelihood():
-    """Reference values from the Bernoulli/Markov likelihoods, not from the implementation."""
+    """Reference values come from scipy Bernoulli log-pmf over the transition pairs.
+
+    History: the first version of this test hardcoded constants produced by a
+    throwaway script that used the implementation's own (wrong) pooled probability
+    (n01+n11)/n, so it could not detect the bug it claimed to check. The values below
+    were recomputed through scipy.stats.bernoulli.logpmf on the two transition
+    sub-samples and the pooled sample, without reusing the implementation algebra.
+    """
     from tailrisk.evaluation import coverage_diagnostics
 
     d = coverage_diagnostics(_hits_with(250, [5, 15, 25, 35, 45, 55, 65, 75, 85, 86]), 0.01)
     assert d["exceedance_count"] == 10
     assert d["exceedance_expected"] == pytest.approx(2.5)
     assert (d["n00"], d["n01"], d["n10"], d["n11"]) == (230, 9, 9, 1)
-    assert d["kupiec_lr_uc"] == pytest.approx(12.955491, rel=1e-6)
-    assert d["kupiec_p_uc"] == pytest.approx(3.1898e-4, rel=1e-3)
-    assert d["christoffersen_lr_ind"] == pytest.approx(0.705717, rel=1e-5)
-    assert d["christoffersen_p_ind"] == pytest.approx(0.400869, rel=1e-4)
-    assert d["christoffersen_lr_cc"] == pytest.approx(12.955491 + 0.705717, rel=1e-5)
-    assert d["christoffersen_p_cc"] == pytest.approx(1.08021e-3, rel=1e-3)
+    assert d["n_transitions"] == 249
+    assert d["kupiec_lr_uc"] == pytest.approx(12.955491062, rel=1e-9)
+    assert d["kupiec_p_uc"] == pytest.approx(3.1898451e-4, rel=1e-5)
+    assert d["christoffersen_lr_ind"] == pytest.approx(0.705549962, rel=1e-9)
+    assert d["christoffersen_p_ind"] == pytest.approx(0.40092509, rel=1e-6)
+    assert d["christoffersen_lr_cc"] == pytest.approx(12.955491062 + 0.705549962, rel=1e-9)
+    assert d["christoffersen_p_cc"] == pytest.approx(1.0802957e-3, rel=1e-5)
+
+
+def test_coverage_diagnostics_hand_computed_six_observation_case():
+    """Hand calculation: hits (0,1,0,1,1,0) at alpha=0.025.
+
+    Transitions: n00=0, n01=2, n10=2, n11=1, T=5. Pooled probability 3/5.
+    LR_ind = -2[2*ln(0.4) + 3*ln(0.6) - (2*ln(0.5) + ln(1/3))] = 2.911032.
+    """
+    from tailrisk.evaluation import coverage_diagnostics
+
+    d = coverage_diagnostics(np.array([0, 1, 0, 1, 1, 0], dtype=bool), 0.025)
+    assert (d["n00"], d["n01"], d["n10"], d["n11"]) == (0, 2, 2, 1)
+    assert d["n_transitions"] == 5
+    assert d["christoffersen_lr_ind"] == pytest.approx(2.91103166, rel=1e-8)
+    assert d["christoffersen_p_ind"] == pytest.approx(0.08797558, rel=1e-6)
+
+
+def test_coverage_diagnostics_break_the_chain_at_gaps():
+    """Pairs that are not consecutive sessions must not enter the Markov likelihood.
+
+    Same hits, one gap: transitions collapse to T=4 with n11=0, giving LR=1.726092
+    instead of the 0.138443 a naive chain over five adjacent pairs would produce.
+    """
+    from tailrisk.evaluation import coverage_diagnostics
+
+    hits = np.array([1, 0, 1, 1, 0, 0], dtype=bool)
+    unbroken = coverage_diagnostics(hits, 0.025)
+    gapped = coverage_diagnostics(hits, 0.025, consecutive=np.array([1, 1, 0, 1, 1], dtype=bool))
+
+    assert unbroken["n_transitions"] == 5 and unbroken["n11"] == 1
+    assert unbroken["christoffersen_lr_ind"] == pytest.approx(0.138442938, rel=1e-8)
+
+    assert gapped["n_transitions"] == 4 and gapped["n_chain_breaks"] == 1
+    assert (gapped["n00"], gapped["n01"], gapped["n10"], gapped["n11"]) == (1, 1, 2, 0)
+    assert gapped["christoffersen_lr_ind"] == pytest.approx(1.726092435, rel=1e-8)
+
+    with pytest.raises(ValueError):
+        coverage_diagnostics(hits, 0.025, consecutive=np.array([1, 1, 1], dtype=bool))
 
 
 def test_coverage_diagnostics_exact_coverage_has_zero_lr():
@@ -135,13 +181,15 @@ def test_coverage_diagnostics_exact_coverage_has_zero_lr():
     # 10 hits out of 200 at alpha=0.05 is exactly the nominal rate.
     assert d["kupiec_lr_uc"] == pytest.approx(0.0, abs=1e-9)
     assert d["kupiec_p_uc"] == pytest.approx(1.0)
+    assert d["n_transitions"] == 199
+    assert d["christoffersen_lr_ind"] == pytest.approx(1.058695346, rel=1e-8)
 
 
 def test_coverage_diagnostics_clustered_hits_reject_independence():
     from tailrisk.evaluation import coverage_diagnostics
 
     d = coverage_diagnostics(_hits_with(100, list(range(40, 60))), 0.10)
-    assert d["christoffersen_lr_ind"] == pytest.approx(80.967404, rel=1e-6)
+    assert d["christoffersen_lr_ind"] == pytest.approx(80.964885235, rel=1e-9)
     assert d["christoffersen_p_ind"] < 1e-12
     assert (d["n00"], d["n01"], d["n10"], d["n11"]) == (78, 1, 1, 19)
 
@@ -165,6 +213,59 @@ def test_coverage_diagnostics_undefined_cases_are_nan_not_imputed():
     # The same isolated hit earlier in the sample keeps all four transition cells usable.
     interior = coverage_diagnostics(_hits_with(50, [20]), 0.025)
     assert np.isfinite(interior["christoffersen_lr_ind"])
+
+    # Every pair separated by a gap leaves no transitions at all.
+    fully_gapped = coverage_diagnostics(
+        np.array([1, 0, 1], dtype=bool), 0.025, consecutive=np.array([0, 0], dtype=bool)
+    )
+    assert fully_gapped["n_transitions"] == 0
+    assert np.isnan(fully_gapped["christoffersen_lr_ind"])
+
+
+def test_chronological_ranks_order_mixed_width_numeric_ids():
+    from tailrisk.evaluation import chronological_ranks
+
+    # Dense 1-based ranks: 62->1, 63->2, 99->3, 100->4, 101->5. A lexicographic
+    # sort would instead put 100 and 101 before 62 and 63.
+    ranks = chronological_ranks(pd.Series(["62", "100", "99", "101", "63"]))
+    assert list(ranks) == [1, 4, 3, 5, 2]
+
+    dates = chronological_ranks(pd.Series(["2020-01-03", "2020-01-02", "2020-01-06"]))
+    assert list(dates) == [2, 1, 3]
+
+    with pytest.raises(ValueError):
+        chronological_ranks(pd.Series(["not-a-date", "also-not"]))
+
+
+def test_evaluate_orders_transitions_chronologically_not_lexicographically():
+    """Ids straddling a digit-width boundary: string order would scramble the chain.
+
+    Origins 8..12 with hits at 9, 10 and 12. Chronologically the hit sequence is
+    0,1,1,0,1 (n11=1) giving LR=1.726092; sorting ids as strings puts 10,11,12 first
+    and yields 1,0,1,0,1 (n11=0), LR=5.545177. The test pins the chronological value.
+    """
+    origins = [10, 11, 12, 8, 9]          # deliberately not in time order
+    realized = [0.01, 0.01, -0.05, 0.01, -0.05]
+    var = [-0.02] * 5                     # hits where realized <= var: 9, 10, 12
+    forecasts = pd.DataFrame(
+        {
+            "series_id": ["ds_test"] * 5,
+            "model_id": ["m"] * 5,
+            "origin_date": origins,
+            "alpha": [0.025] * 5,
+            "var": var,
+            "es": [-0.03] * 5,
+            "realized_return": realized,
+            "scale": [0.01] * 5,
+            "status": ["ok"] * 5,
+        }
+    )
+    metrics = evaluate_forecasts(forecasts, pd.DataFrame(), "ds")
+    row = metrics.iloc[0]
+    assert row["n_transitions"] == 4
+    assert row["n_chain_breaks"] == 0
+    assert row["christoffersen_lr_ind"] == pytest.approx(1.726092435, rel=1e-8)
+    assert row["christoffersen_lr_ind"] != pytest.approx(5.545177444, rel=1e-6)
 
 
 def test_evaluate_uses_common_mask_across_models():
