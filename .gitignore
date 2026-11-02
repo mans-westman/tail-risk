@@ -58,7 +58,6 @@ htmlcov/
 # Internal agent docs
 AGENTS.md
 STATUS.md
-GIT_WORKFLOW.md
 
 PROJECT_GUIDE.md 
 DECISIONS.md 
