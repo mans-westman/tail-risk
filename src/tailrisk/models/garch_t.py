@@ -1,48 +1,25 @@
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from arch.univariate import ZeroMean
+from arch.univariate import GARCH, StudentsT, ZeroMean
+from scipy.stats import t as student_t
 
-from ..conventions import validate_alpha, validate_returns
+from tailrisk.conventions import validate_alpha_grid, validate_nu, validate_returns
+from tailrisk.features import FEATURE_WARMUP
 
-
-@dataclass(frozen=True)
-class GarchForecast:
-    """One origin/alpha forecast from a fitted GARCH(1,1)-Student-t model."""
-
-    origin_index: int
-    target_index: int
-    alpha: float
-    var: float
-    es: float
-    scale: float
-    status: str
+from .base import ModelForecast, RiskModel
 
 
-@dataclass(frozen=True)
-class GarchFit:
-    """Fitted-model container."""
-
-    params: dict[str, Any]
-    converged: bool
-    warnings: list[str]
-    conditional_variances: np.ndarray
-    fitted_values: np.ndarray
-
-
-def _validate_fit_warnings(res) -> list[str]:
+def _validate_fit_warnings(res: Any) -> list[str]:
     """Capture arch convergence / boundary warnings as text."""
     out: list[str] = []
     if not hasattr(res, "convergence_flag"):
         return out
     if res.convergence_flag != 0:
         out.append(f"arch convergence_flag={res.convergence_flag}")
-    # arch 8.x stores parameter covariance and std err; if std err contains
-    # NaN or the hessian is singular we want to know.
     try:
         std_err = res.std_err
         if std_err is not None and np.any(~np.isfinite(std_err)):
@@ -52,115 +29,135 @@ def _validate_fit_warnings(res) -> list[str]:
     return out
 
 
-def fit_garch_student_t(
-    returns: np.ndarray | list[float],
-    *,
-    rescale: bool = True,
-) -> GarchFit:
-    """Fit zero-mean GARCH(1,1) with standardized Student-t innovations.
-
-    Args:
-        returns: decimal signed daily returns.
-        rescale: if True, multiply returns by 100 for fitting stability and
-            divide output forecasts by 100. This matches arch's percent-scale
-            convention while keeping the returned risk in decimal return units.
-    """
-    values = validate_returns(returns)
-    scale_factor = 100.0 if rescale else 1.0
-    fit_returns = values * scale_factor
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        model = ZeroMean(
-            fit_returns,
-            volatility={"name": "GARCH", "p": 1, "q": 1},
-            distribution={"name": "studentst"},
-        )
-        res = model.fit(disp="off")
-
-    warn_texts = [str(w.message) for w in caught] + _validate_fit_warnings(res)
-
-    return GarchFit(
-        params=dict(res.params),
-        converged=bool(res.convergence_flag == 0),
-        warnings=warn_texts,
-        conditional_variances=np.asarray(res.conditional_variance, dtype=float) / scale_factor**2,
-        fitted_values=np.asarray(res.params),
-    )
-
-
-def forecast_garch_var_es(
-    fit: GarchFit,
-    train_returns: np.ndarray | list[float],
-    test_returns: np.ndarray | list[float],
-    alpha_grid: list[float] | tuple[float, ...] | np.ndarray,
-    *,
-    rescale: bool = True,
-) -> list[GarchForecast]:
-    """Walk-forward one-step GARCH(1,1)-t VaR/ES on a test path.
-
-    Causal state update: after each test return is realized, the variance is
-    updated using the fitted GARCH coefficients. Parameters remain frozen.
-    """
-    train = validate_returns(train_returns)
-    test = validate_returns(test_returns)
-    alphas = np.asarray(alpha_grid, dtype=float)
-    for alpha in alphas:
-        validate_alpha(alpha)
-
-    scale_factor = 100.0 if rescale else 1.0
-
-    # Fitted coefficients are in the (possibly rescaled) units used for fitting.
-    omega = float(fit.params["omega"]) / scale_factor**2
-    alpha_coef = float(fit.params["alpha[1]"])
-    beta_coef = float(fit.params["beta[1]"])
-    nu = float(fit.params["nu"])
-
-    # Walk-forward variance recursion. The last in-sample conditional variance
-    # is the forecast for the first test observation. For numerical stability
-    # we keep variances in decimal-return units.
-    sigma2 = float(fit.conditional_variances[-1])
-    last_return = float(train[-1])
-
-    forecasts: list[GarchForecast] = []
-    for t, ret in enumerate(test):
-        sigma = float(np.sqrt(max(sigma2, 1e-12)))
-        for alpha in alphas:
-            var, es = _garch_t_risk(alpha, sigma, nu)
-            forecasts.append(
-                GarchForecast(
-                    origin_index=len(train) + t - 1,
-                    target_index=len(train) + t,
-                    alpha=float(alpha),
-                    var=var,
-                    es=es,
-                    scale=sigma,
-                    status="ok",
-                )
-            )
-        # Update with the realized test return (causal state update, not refit).
-        sigma2 = omega + alpha_coef * (ret**2) + beta_coef * sigma2
-        last_return = float(ret)
-
-    return forecasts
-
-
-def _garch_t_risk(alpha: float, sigma: float, nu: float) -> tuple[float, float]:
-    """Return VaR/ES for a standardized Student-t innovation with scale sigma.
+def innovation_var_es(alpha: float, sigma: float, nu: float) -> tuple[float, float]:
+    """VaR/ES for sigma * standardized Student-t innovation (unit variance).
 
     Uses the same unit-variance construction as the synthetic oracle:
-    epsilon = sqrt((nu-2)/nu) * T_nu.
+    epsilon = sqrt((nu-2)/nu) * T_nu. Independent of `arch` internals and
+    hand-checkable against the guide's section 4.2 formulas.
     """
-    from scipy.stats import t as student_t
-
-    validate_alpha(alpha)
+    alpha = float(alpha)
+    if not np.isfinite(alpha) or not 0.0 < alpha < 0.5:
+        raise ValueError(f"alpha must be finite and in (0, 0.5), got {alpha}")
     if not np.isfinite(sigma) or sigma <= 0.0:
         raise ValueError("sigma must be finite and positive")
-    if not np.isfinite(nu) or nu <= 2.0:
-        raise ValueError("nu must be finite and > 2")
+    nu = validate_nu(nu)
 
     c_nu = np.sqrt((nu - 2.0) / nu)
     x_alpha = student_t.ppf(alpha, df=nu)
     var = sigma * c_nu * x_alpha
     es = -sigma * c_nu * (nu + x_alpha**2) / (nu - 1.0) * student_t.pdf(x_alpha, df=nu) / alpha
     return float(var), float(es)
+
+
+class GarchStudentTModel(RiskModel):
+    """Fitted zero-mean GARCH(1,1) with standardized Student-t innovations.
+
+    `arch` is used only for parameter estimation on the training partition
+    (returns multiplied by 100 for fitting stability; parameters converted
+    back to decimal-return units). Forecasts are produced by an explicit
+    frozen-parameter GARCH(1,1) variance recursion:
+
+        sigma2_{t+1} = omega + a * r_t^2 + b * sigma2_t
+
+    initialized per path at the unconditional variance
+    omega / (1 - a - b), never carried across independent partitions.
+    Model forecasts use observed returns only; oracle values are never inputs.
+    """
+
+    model_id = "garch_student_t"
+
+    def __init__(self):
+        self._params: dict[str, float] | None = None
+        self._nu: float | None = None
+        self._fit_info: dict[str, Any] = {}
+
+    def fit(self, returns: np.ndarray) -> "GarchStudentTModel":
+        values = validate_returns(returns, min_length=FEATURE_WARMUP + 1)
+        scale_factor = 100.0  # percent-scale fitting for numerical stability
+        fit_returns = values * scale_factor
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            model = ZeroMean(fit_returns, rescale=False)
+            model.volatility = GARCH(1, 0, 1)
+            model.distribution = StudentsT()
+            res = model.fit(disp="off", show_warning=False)
+
+        params = {name: float(value) for name, value in res.params.items()}
+        for key in ("omega", "alpha[1]", "beta[1]", "nu"):
+            if key not in params:
+                raise ValueError(f"arch fit missing parameter: {key}")
+        convergence_flag = int(getattr(res, "convergence_flag", getattr(res, "convergence", -1)))
+
+        # Convert percent-scale parameters back to decimal-return units.
+        self._params = {
+            "omega": params["omega"] / scale_factor**2,
+            "alpha[1]": params["alpha[1]"],
+            "beta[1]": params["beta[1]"],
+            "nu": params["nu"],
+        }
+        self._nu = self._params["nu"]
+        self._fit_info = {
+            "estimator": "arch ZeroMean GARCH(1,1) StudentsT, fit on x100 rescaled returns",
+            "params_decimal": dict(self._params),
+            "params_percent_scale": params,
+            "convergence_flag": convergence_flag,
+            "loglikelihood": float(res.loglikelihood),
+            "train_length": int(values.size),
+            "warnings": [str(w.message) for w in caught] + _validate_fit_warnings(res),
+        }
+        return self
+
+    def _sigma2_path(self, values: np.ndarray) -> np.ndarray:
+        """sigma2_{t+1} forecast for each origin t, frozen parameters,
+        initialized at the unconditional variance (per-path, no carry-over)."""
+        omega = self._params["omega"]
+        a = self._params["alpha[1]"]
+        b = self._params["beta[1]"]
+        persistence = a + b
+        if not persistence < 1.0:
+            raise ValueError("fitted GARCH parameters must satisfy a + b < 1")
+        unconditional = omega / (1.0 - persistence)
+        sigma2 = np.empty(values.size, dtype=float)
+        state = unconditional  # sigma2_0 initialization (declared rule)
+        for index in range(values.size):
+            sigma2[index] = state  # variance forecast for observation `index`
+            state = omega + a * values[index] ** 2 + b * state
+        return sigma2
+
+    def predict(
+        self, returns: np.ndarray, alphas: np.ndarray
+    ) -> list[ModelForecast]:
+        if self._params is None:
+            raise RuntimeError("model must be fitted before predict")
+        values = validate_returns(returns, min_length=FEATURE_WARMUP + 1)
+        alphas = validate_alpha_grid(alphas)
+        sigma2 = self._sigma2_path(values)
+        nu = self._nu
+
+        forecasts: list[ModelForecast] = []
+        origin_start = FEATURE_WARMUP - 1
+        for origin in range(origin_start, values.size - 1):
+            sigma = float(np.sqrt(max(sigma2[origin + 1], 1e-300)))
+            status = "ok" if np.isfinite(sigma) and sigma > 0.0 else "failed"
+            for alpha in alphas:
+                if status == "ok":
+                    var, es = innovation_var_es(float(alpha), sigma, nu)
+                else:
+                    var, es = np.nan, np.nan
+                forecasts.append(
+                    ModelForecast(
+                        origin_index=origin,
+                        target_index=origin + 1,
+                        alpha=float(alpha),
+                        var=var,
+                        es=es,
+                        scale=sigma,
+                        status=status,
+                    )
+                )
+        return forecasts
+
+    def summary(self) -> dict[str, Any]:
+        return self._fit_info.copy()

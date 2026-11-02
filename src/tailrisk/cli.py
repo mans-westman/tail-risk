@@ -36,6 +36,8 @@ FORECAST_COLUMNS = [
 ]
 
 MODEL_HISTORICAL = "historical_simulation"
+MODEL_GARCH_T = "garch_student_t"
+SUPPORTED_MODELS = (MODEL_HISTORICAL, MODEL_GARCH_T)
 
 
 def _load_config(path: Path) -> dict:
@@ -70,6 +72,13 @@ def _resolve_config(config: dict) -> dict:
     resolved.setdefault("historical_window", 100)
     if resolved["historical_window"] < 1:
         raise ValueError("historical_window must be >= 1")
+    models = list(resolved.get("models", [MODEL_HISTORICAL]))
+    if not models:
+        raise ValueError("models must be a nonempty list")
+    unknown = [name for name in models if name not in SUPPORTED_MODELS]
+    if unknown:
+        raise ValueError(f"unsupported models: {unknown}; supported: {list(SUPPORTED_MODELS)}")
+    resolved["models"] = models
     return resolved
 
 
@@ -141,6 +150,43 @@ def _forecast_rows(resolved: dict, partitions: dict) -> list[dict]:
     return rows
 
 
+def _garch_rows(resolved: dict, partitions: dict) -> tuple[list[dict], dict]:
+    """GARCH-t rows: fit on the training partition only (frozen parameters),
+    then walk-forward each partition independently (per-path filter state)."""
+    from .models.garch_t import GarchStudentTModel
+
+    alpha_grid = resolved["alpha_grid"]
+    run_id = resolved.get("run_id", "run")
+    dataset_id = resolved.get("dataset_id", "synthetic")
+    model = GarchStudentTModel()
+    model.fit(partitions["train"].returns)
+
+    rows: list[dict] = []
+    for name, path in partitions.items():
+        series_id = f"{dataset_id}_{name}"
+        realized_returns = path.returns
+        for forecast in model.predict(realized_returns, np.asarray(alpha_grid, dtype=float)):
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "dataset_id": dataset_id,
+                    "series_id": series_id,
+                    "model_id": MODEL_GARCH_T,
+                    "data_seed": resolved["seeds"][name],
+                    "model_seed": "",
+                    "origin_date": str(forecast.origin_index),
+                    "target_date": str(forecast.target_index),
+                    "alpha": float(forecast.alpha),
+                    "var": float(forecast.var),
+                    "es": float(forecast.es),
+                    "scale": float(forecast.scale),
+                    "realized_return": float(realized_returns[forecast.target_index]),
+                    "status": forecast.status,
+                }
+            )
+    return rows, model.summary()
+
+
 def _oracle_rows(resolved: dict, partitions: dict) -> list[dict]:
     alpha_grid = resolved["alpha_grid"]
     dataset_id = resolved.get("dataset_id", "synthetic")
@@ -182,7 +228,15 @@ def cmd_run(config_path: str, output: str) -> int:
     checks = run_offline_checks()
     checks_passed = all_checks_pass(checks)
 
-    forecasts = _forecast_rows(resolved, partitions)
+    forecasts: list[dict] = []
+    fit_info: dict[str, dict] = {}
+    for model_name in resolved["models"]:
+        if model_name == MODEL_HISTORICAL:
+            forecasts.extend(_forecast_rows(resolved, partitions))
+        elif model_name == MODEL_GARCH_T:
+            garch_rows, garch_summary = _garch_rows(resolved, partitions)
+            forecasts.extend(garch_rows)
+            fit_info[MODEL_GARCH_T] = garch_summary
     oracle = _oracle_rows(resolved, partitions)
 
     # Training payload must not expose oracle fields; oracle is a separate artifact.
@@ -194,16 +248,22 @@ def cmd_run(config_path: str, output: str) -> int:
         out_dir / "forecasts.csv", index=False
     )
     pd.DataFrame(oracle).to_csv(out_dir / "oracle_curves.csv", index=False)
+    manifest = _manifest(config, resolved, start, "complete" if checks_passed else "partial")
+    if fit_info:
+        manifest["model_fit_info"] = fit_info
     with open(out_dir / "manifest.json", "w", encoding="utf-8") as handle:
-        json.dump(_manifest(config, resolved, start, "complete" if checks_passed else "partial"), handle, indent=2)
+        json.dump(manifest, handle, indent=2)
 
     summary = _summary_md(resolved, out_dir, checks, forecasts)
     with open(out_dir / "summary.md", "w", encoding="utf-8") as handle:
         handle.write(summary)
 
+    model_counts: dict[str, int] = {}
+    for row in forecasts:
+        model_counts[row["model_id"]] = model_counts.get(row["model_id"], 0) + 1
     print(f"run complete -> {out_dir}")
     print(f"  partitions: { {k: len(v.returns) for k, v in partitions.items()} }")
-    print(f"  forecasts: {len(forecasts)} rows ({MODEL_HISTORICAL})")
+    print(f"  forecasts: {len(forecasts)} rows {model_counts}")
     print(f"  offline checks: {sum(c['passed'] for c in checks)}/{len(checks)} passed")
     return 0 if checks_passed else 1
 
@@ -218,6 +278,7 @@ def _summary_md(resolved: dict, out_dir: Path, checks: list[dict], forecasts: li
         f"- Partitions: {resolved['partitions']}",
         f"- Alpha grid: {resolved['alpha_grid']}",
         f"- Historical window: {resolved['historical_window']}",
+        f"- Models: {resolved['models']}",
         f"- Forecast rows: {len(forecasts)}",
         "",
         "## Offline checks",
@@ -263,6 +324,140 @@ def cmd_verify(run_dir: str) -> int:
     return 0 if passed else 1
 
 
+def _read_run_csv(directory: Path, name: str) -> pd.DataFrame:
+    path = directory / name
+    if not path.exists():
+        raise ArtifactVerificationError(f"missing required artifact: {path}")
+    return pd.read_csv(path)
+
+
+def cmd_evaluate(run_dir: str) -> int:
+    """Score saved forecasts on original-unit returns; writes metrics.csv only."""
+    from .evaluation import evaluate_forecasts
+
+    directory = Path(run_dir)
+    if not directory.exists():
+        print(f"run directory not found: {directory}", file=sys.stderr)
+        return 2
+    try:
+        forecasts = _read_run_csv(directory, "forecasts.csv")
+        oracle = _read_run_csv(directory, "oracle_curves.csv")
+        resolved = _read_json_artifact(directory / "config.resolved.json")
+    except ArtifactVerificationError as exc:
+        print(f"evaluation failed: {exc}", file=sys.stderr)
+        return 2
+
+    dataset_id = str(resolved.get("dataset_id", "synthetic"))
+    metrics = evaluate_forecasts(forecasts, oracle, dataset_id)
+    if metrics.empty:
+        print("evaluation produced no metrics: no 'ok' forecast rows", file=sys.stderr)
+        return 1
+    metrics_path = directory / "metrics.csv"
+    metrics.to_csv(metrics_path, index=False)
+    print(f"evaluation complete -> {metrics_path} ({len(metrics)} rows)")
+    return 0
+
+
+def _read_json_artifact(path: Path) -> dict:
+    if not path.exists():
+        raise ArtifactVerificationError(f"missing required artifact: {path}")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ArtifactVerificationError(f"malformed JSON in {path}: {exc}") from exc
+
+
+def cmd_report(run_dir: str) -> int:
+    """Assemble a concise report.md from existing artifacts (no recomputation)."""
+    directory = Path(run_dir)
+    if not directory.exists():
+        print(f"run directory not found: {directory}", file=sys.stderr)
+        return 2
+    try:
+        manifest = _read_json_artifact(directory / "manifest.json")
+        checks = _read_json_artifact(directory / "checks.json")
+    except ArtifactVerificationError as exc:
+        print(f"report failed: {exc}", file=sys.stderr)
+        return 2
+    artifact_verification = None
+    av_path = directory / "artifact_verification.json"
+    if av_path.exists():
+        artifact_verification = _read_json_artifact(av_path)
+    metrics_path = directory / "metrics.csv"
+    if not metrics_path.exists():
+        print(
+            f"report requires metrics.csv; run `tailrisk evaluate --run {directory}` first",
+            file=sys.stderr,
+        )
+        return 2
+    metrics = pd.read_csv(metrics_path)
+
+    resolved = manifest.get("config_resolved", {})
+    lines = [
+        "# Tail-risk run report",
+        "",
+        f"- Run id: {resolved.get('run_id', 'run')}",
+        f"- Created: {manifest.get('created_utc')}",
+        f"- Manifest status: {manifest.get('status')}",
+        f"- DGP: {resolved.get('dgp')}",
+        f"- Partitions: {resolved.get('partitions')}",
+        f"- Models: {resolved.get('models')}",
+        f"- Alpha grid: {resolved.get('alpha_grid')}",
+        f"- Runtime (s): {manifest.get('runtime_seconds')}",
+        "",
+        "## Independent checks",
+        "",
+    ]
+    if artifact_verification is not None:
+        passed = sum(1 for c in artifact_verification["checks"] if c["passed"])
+        lines.append(
+            f"- Artifact verification: {passed}/{len(artifact_verification['checks'])} passed "
+            f"(see `artifact_verification.json`)"
+        )
+    else:
+        lines.append("- Artifact verification: not run yet (`tailrisk verify --run ...`)")
+    lines.append(
+        f"- Offline mathematical checks: "
+        f"{sum(1 for c in checks.get('checks', []) if c.get('passed'))}/{len(checks.get('checks', []))} passed"
+    )
+
+    lines += [
+        "",
+        "## Metrics by split, model, and alpha (original return units)",
+        "",
+        "| split | model | alpha | n | mean FZ0 | mean quantile loss | exceedance rate | VaR RMSE vs oracle | ES RMSE vs oracle |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for row in metrics.itertuples(index=False):
+        lines.append(
+            f"| {row.split} | {row.model_id} | {row.alpha} | {row.n} | "
+            f"{row.mean_fz0:.6g} | {row.mean_quantile_loss:.6g} | {row.exceedance_rate:.4f} | "
+            f"{row.var_rmse_vs_oracle:.6g} | {row.es_rmse_vs_oracle:.6g} |"
+        )
+    lines += [
+        "",
+        "## Limitations",
+        "",
+        "- Synthetic smoke/development data only; no market data or statistical claims.",
+        "- Oracle comparisons use the privileged full-state synthetic oracle and are",
+        "  implementation checks, not forecasting skill evidence.",
+        "- Mean FZ0/quantile-loss comparisons across models are descriptive at this stage,",
+        "  not the prespecified research comparison.",
+        "",
+        "## Artifacts",
+        "",
+        "- `forecasts.csv`, `oracle_curves.csv`, `metrics.csv`",
+        "- `checks.json` (offline checks), `artifact_verification.json` (artifact checks)",
+        "- `manifest.json`, `summary.md`",
+    ]
+    report_path = directory / "report.md"
+    with open(report_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    print(f"report complete -> {report_path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="tailrisk", description="Conditional tail-risk forecasting workflow")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -274,11 +469,21 @@ def main(argv: list[str] | None = None) -> int:
     verify_p = sub.add_parser("verify", help="inspect and verify saved run artifacts")
     verify_p.add_argument("--run", required=True, help="run output directory")
 
+    evaluate_p = sub.add_parser("evaluate", help="score saved forecasts; writes metrics.csv")
+    evaluate_p.add_argument("--run", required=True, help="run output directory")
+
+    report_p = sub.add_parser("report", help="write report.md from existing artifacts")
+    report_p.add_argument("--run", required=True, help="run output directory")
+
     args = parser.parse_args(argv)
     if args.command == "run":
         return cmd_run(args.config, args.output)
     if args.command == "verify":
         return cmd_verify(args.run)
+    if args.command == "evaluate":
+        return cmd_evaluate(args.run)
+    if args.command == "report":
+        return cmd_report(args.run)
     parser.error(f"unknown command: {args.command}")
     return 2
 

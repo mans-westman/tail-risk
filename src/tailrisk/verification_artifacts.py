@@ -19,6 +19,8 @@ FORECAST_COLUMNS = [
 ORACLE_COLUMNS = ["series_id", "origin_date", "target_date", "alpha", "sigma", "oracle_var", "oracle_es"]
 
 MODEL_HISTORICAL = "historical_simulation"
+MODEL_GARCH_T = "garch_student_t"
+_KNOWN_MODELS = {MODEL_HISTORICAL, MODEL_GARCH_T}
 _VALID_STATUSES = {"ok", "failed", "missing"}
 
 
@@ -102,7 +104,13 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
     )
 
     alpha_grid = list(resolved.get("alpha_grid", []))
-    expected_models = {MODEL_HISTORICAL}
+    expected_models = set(resolved.get("models", [MODEL_HISTORICAL]))
+    unknown_models = expected_models - _KNOWN_MODELS
+    if unknown_models:
+        raise ArtifactVerificationError(
+            f"config.resolved.json declares unsupported models: {sorted(unknown_models)}; "
+            f"supported: {sorted(_KNOWN_MODELS)}"
+        )
 
     # --- forecast table checks -------------------------------------------------
     if forecasts.empty:
@@ -119,12 +127,12 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
         _record(
             checks,
             "expected_models_present",
-            models_present <= expected_models,
-            f"models found={sorted(models_present)} expected subset={sorted(expected_models)}",
+            models_present == expected_models,
+            f"models found={sorted(models_present)} expected={sorted(expected_models)}",
         )
 
-        alphas_present = set(np.round(forecasts["alpha"].astype(float).unique(), 12))
-        expected_alphas = set(np.round(np.asarray(alpha_grid, dtype=float), 12))
+        alphas_present = {round(float(a), 12) for a in forecasts["alpha"].astype(float).unique()}
+        expected_alphas = {round(float(a), 12) for a in alpha_grid}
         _record(
             checks,
             "alpha_levels_match_config",
@@ -298,7 +306,7 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
 
         # Recompute historical forecasts independently (without oracle inputs) and
         # compare exported var/es to ensure the run used the declared window/timing.
-        if not forecasts.empty:
+        if not forecasts.empty and MODEL_HISTORICAL in expected_models:
             window = resolved["historical_window"]
             origin_start = max(window, FEATURE_WARMUP - 1)
             forecast_mismatches = 0
@@ -308,7 +316,10 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
                 returns = path.returns
                 features = build_feature_frame(returns)
                 scale_by_origin = {int(r.origin_index): float(r.return_scale) for r in features.itertuples()}
-                subset = forecasts[forecasts["series_id"] == series_id]
+                subset = forecasts[
+                    (forecasts["series_id"] == series_id)
+                    & (forecasts["model_id"] == MODEL_HISTORICAL)
+                ]
                 for row in subset.itertuples(index=False):
                     origin = int(row.origin_date)
                     if origin < origin_start or origin >= returns.size - 1:
@@ -326,6 +337,42 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
             if forecast_mismatches > 0 or forecast_compared == 0:
                 replay_ok = False
             replay_detail += f"; historical forecast mismatches={forecast_mismatches} compared={forecast_compared}"
+
+        # Recompute GARCH-t forecasts: refit on the train partition (deterministic
+        # arch MLE) and compare exported var/es/scale for garch rows. Model
+        # forecasts use observed returns only; oracle values are never inputs.
+        if not forecasts.empty and MODEL_GARCH_T in expected_models:
+            from .models.garch_t import GarchStudentTModel
+
+            garch_model = GarchStudentTModel()
+            garch_model.fit(partitions["train"].returns)
+            garch_mismatches = 0
+            garch_compared = 0
+            for name, path in partitions.items():
+                series_id = f"{dataset_id}_{name}"
+                subset = forecasts[
+                    (forecasts["series_id"] == series_id)
+                    & (forecasts["model_id"] == MODEL_GARCH_T)
+                ]
+                expected_by_key: dict[tuple[int, float], tuple[float, float, float]] = {}
+                for f in garch_model.predict(path.returns, np.asarray(alpha_grid, dtype=float)):
+                    expected_by_key[(f.origin_index, float(f.alpha))] = (f.var, f.es, f.scale)
+                for row in subset.itertuples(index=False):
+                    key = (int(row.origin_date), float(row.alpha))
+                    if key not in expected_by_key:
+                        garch_mismatches += 1
+                        continue
+                    e_var, e_es, e_scale = expected_by_key[key]
+                    garch_compared += 1
+                    if not (
+                        np.isclose(float(row.var), e_var, rtol=1e-7, atol=1e-12)
+                        and np.isclose(float(row.es), e_es, rtol=1e-7, atol=1e-12)
+                        and np.isclose(float(row.scale), e_scale, rtol=1e-7, atol=1e-12)
+                    ):
+                        garch_mismatches += 1
+            if garch_mismatches > 0 or garch_compared == 0:
+                replay_ok = False
+            replay_detail += f"; garch forecast mismatches={garch_mismatches} compared={garch_compared}"
     except Exception as exc:  # noqa: BLE001 - surface actionable replay failure
         replay_ok = False
         replay_detail = f"replay failed: {exc}"
