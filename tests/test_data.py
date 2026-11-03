@@ -137,6 +137,28 @@ def test_validate_rejects_non_positive_prices_and_sorts():
     assert findings["out_of_order_steps"] == 1
 
 
+def test_validate_closes_rejects_missing_midweek_close():
+    """A missing trading close must be rejected, not silently dropped to bridge sessions."""
+    dates = pd.to_datetime(["2020-01-06", "2020-01-07", "2020-01-08", "2020-01-09"])
+    frame = pd.DataFrame({"session_date": dates, "close": [100.0, 101.0, np.nan, 102.0]})
+    with pytest.raises(DataError, match="missing/null closes"):
+        validate_closes(frame)
+
+
+def test_validate_closes_rejects_wholly_constant_prices():
+    dates = pd.to_datetime(["2020-01-06", "2020-01-07", "2020-01-08"])
+    frame = pd.DataFrame({"session_date": dates, "close": [100.0, 100.0, 100.0]})
+    with pytest.raises(DataError, match="wholly constant"):
+        validate_closes(frame)
+
+
+def test_closes_to_log_returns_rejects_wholly_constant_zero_returns():
+    dates = pd.to_datetime(["2020-01-06", "2020-01-07", "2020-01-08", "2020-01-09"])
+    frame = pd.DataFrame({"session_date": dates, "close": [100.0, 100.0, 100.0, 100.0]})
+    with pytest.raises(DataError, match="wholly constant"):
+        closes_to_log_returns(frame)
+
+
 def test_long_gaps_are_preserved_and_reported_not_filled():
     """A closure keeps the next observed close-to-close return; no row is inserted."""
     dates = pd.to_datetime(["2001-09-10", "2001-09-17", "2001-09-18"])

@@ -83,3 +83,49 @@ def test_kurtosis_nan_for_constant_window():
 def test_feature_frame_rejects_short_input():
     with pytest.raises(ValueError):
         build_feature_frame([0.01] * 60)
+
+
+def test_feature_causality_future_perturbation_cannot_affect_earlier_features():
+    """Changing observations strictly after origin t must not change features or scale at <= t.
+
+    Separately, future target return labels (at t+1 for origin t) must reflect the shock.
+    """
+    rng = np.random.default_rng(20261103)
+    # Nontrivial deterministic series of length 200
+    base_returns = rng.normal(0.0005, 0.012, size=200)
+    base_frame = build_feature_frame(base_returns)
+
+    # Choose a forecast origin well after warm-up (warmup is 62)
+    k = 120
+    assert k in set(base_frame["origin_index"])
+
+    # Perturb returns strictly after origin k (at indices k + 1, k + 2, ...)
+    perturbed_returns = base_returns.copy()
+    perturbed_returns[k + 1 :] += 0.08  # large future shock
+
+    perturbed_frame = build_feature_frame(perturbed_returns)
+    assert len(base_frame) == len(perturbed_frame)
+
+    for base_row, pert_row in zip(base_frame.itertuples(), perturbed_frame.itertuples()):
+        origin = base_row.origin_index
+        assert origin == pert_row.origin_index
+        assert base_row.target_index == pert_row.target_index
+
+        if origin <= k:
+            # Information strictly through origin: features and scale MUST be identical
+            assert pert_row.return_scale == pytest.approx(base_row.return_scale, rel=1e-12)
+            for feat in FEATURE_NAMES:
+                val_base = getattr(base_row, feat)
+                val_pert = getattr(pert_row, feat)
+                assert val_pert == pytest.approx(val_base, rel=1e-12)
+            # The target return for origin k is index k+1, which WAS perturbed
+            if origin == k:
+                assert pert_row.target_return != base_row.target_return
+                assert pert_row.target_return == pytest.approx(base_row.target_return + 0.08, rel=1e-12)
+        else:
+            # Origins after k use the perturbed history: at least one feature must change
+            features_differ = any(
+                getattr(pert_row, feat) != getattr(base_row, feat)
+                for feat in FEATURE_NAMES
+            )
+            assert features_differ

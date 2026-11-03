@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version as _distribution_version
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from .data import DataError, load_panel
+from .data import DataError, load_panel, validate_cutoffs
 from .features import FEATURE_WARMUP, build_feature_frame
 from .historical import historical_var_es
 from .simulation import generate_partitions
@@ -86,13 +87,39 @@ class _Source:
         return {label: index for index, label in enumerate(self.origin_labels)}
 
 
-def _rebuild_sources(resolved: dict) -> tuple[dict[str, _Source], dict | None]:
+def _effective_cutoffs(resolved: dict) -> tuple[dict, str]:
+    """Split boundaries as frozen in the run config, else as declared by its audit.
+
+    The audit fallback exists so a run created before cutoffs were frozen can still be
+    replayed against the protocol it declared at creation. It never upgrades such a run
+    to a pass on ``effective_cutoffs_frozen``, which reads the run config only: a legacy
+    run is replayable and still demonstrably not frozen.
+    """
+    try:
+        return validate_cutoffs(resolved.get("cutoffs")), "config.resolved.json"
+    except ValueError as config_error:
+        audit_path = (resolved.get("data") or {}).get("audit")
+        if not audit_path:
+            raise
+        try:
+            audit = json.loads(Path(audit_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raise config_error
+        declared = audit.get("cutoffs") or (audit.get("splits") or {}).get("cutoffs")
+        try:
+            return validate_cutoffs(declared), f"data.audit {audit_path}"
+        except ValueError:
+            raise config_error
+
+
+def _rebuild_sources(resolved: dict) -> tuple[dict[str, _Source], dict | None, str]:
     """Re-derive the run's series from config plus public inputs.
 
     Synthetic runs regenerate paths from the declared DGP and seeds; real runs reload the
     panel the config points at. Either way the returned series are built from inputs, not
     copied from the forecast artifact under test.
     """
+    allowed_splits = set(resolved.get("splits", ("train", "validation", "test")))
     if resolved.get("dataset_kind") == "real":
         panel = (resolved.get("data") or {}).get("panel")
         if not panel:
@@ -100,7 +127,15 @@ def _rebuild_sources(resolved: dict) -> tuple[dict[str, _Source], dict | None]:
                 "config.resolved.json declares a real-data run without data.panel"
             )
         try:
-            splits = load_panel(panel)
+            cutoffs, cutoff_source = _effective_cutoffs(resolved)
+        except ValueError as exc:
+            # No declared protocol anywhere: refuse to replay rather than replaying
+            # against an undeclared boundary. The reason is reported, not swallowed.
+            return {}, None, f"no valid cutoff protocol ({exc}); refusing to replay"
+        protocol = {"cutoffs": cutoffs}
+
+        try:
+            splits = load_panel(panel, protocol=protocol)
         except (DataError, OSError) as exc:
             raise ArtifactVerificationError(f"panel referenced by the run is unusable: {exc}") from exc
         sources = {
@@ -112,12 +147,15 @@ def _rebuild_sources(resolved: dict) -> tuple[dict[str, _Source], dict | None]:
                 target_labels=part.target_dates,
             )
             for name, part in splits.items()
+            if name in allowed_splits
         }
-        return sources, None
+        return sources, None, f"cutoffs from {cutoff_source}"
 
+    part_lengths = {k: v for k, v in resolved["partitions"].items() if k in allowed_splits}
+    part_seeds = {k: v for k, v in resolved["seeds"].items() if k in allowed_splits}
     partitions = generate_partitions(
-        resolved["partitions"],
-        resolved["seeds"],
+        part_lengths,
+        part_seeds,
         **resolved["dgp"],
         alphas=resolved["alpha_grid"],
     )
@@ -132,7 +170,7 @@ def _rebuild_sources(resolved: dict) -> tuple[dict[str, _Source], dict | None]:
             origin_labels=tuple(str(index) for index in range(returns.size)),
             target_labels=tuple(str(index) for index in range(1, returns.size)),
         )
-    return sources, partitions
+    return sources, partitions, ""
 
 
 def _session_chain(checks: list[dict], forecasts: pd.DataFrame, sources: dict[str, _Source], real: bool) -> None:
@@ -163,6 +201,42 @@ def _session_chain(checks: list[dict], forecasts: pd.DataFrame, sources: dict[st
     _record(checks, name, passed, detail)
 
 
+def _package_version(name: str) -> str:
+    """Installed version of a distribution, or '' when it is not importable here."""
+    try:
+        return _distribution_version(name)
+    except PackageNotFoundError:
+        return ""
+
+
+def _environment_drift(manifest: dict) -> str:
+    """Name the dependency drift between this interpreter and the run's manifest.
+
+    Replay refits MLE parameters, so agreement to 1e-7 presupposes the same numeric
+    builds. Differing builds are not corruption, but they make a numeric mismatch
+    uninformative; saying so keeps the operator from misreading it as evidence damage.
+    """
+    recorded = manifest.get("dependencies") or {}
+    current = {
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+        "scipy": _package_version("scipy"),
+        "arch": _package_version("arch"),
+    }
+    drift = [
+        f"{name} {current[name]} vs {recorded[name]}"
+        for name in ("numpy", "pandas", "scipy", "arch")
+        if recorded.get(name) and current.get(name) and recorded[name] != current[name]
+    ]
+    if not drift:
+        return ""
+    return (
+        "; replay environment differs from manifest ("
+        + ", ".join(drift)
+        + "): numeric agreement requires tightly matching dependency builds"
+    )
+
+
 def _replay(
     checks: list[dict],
     resolved: dict,
@@ -173,6 +247,7 @@ def _replay(
     expected_models: set[str],
     alpha_grid: list[float],
     real: bool,
+    env_note: str = "",
 ) -> None:
     """Rebuild realised returns, oracle values and model forecasts from scratch."""
     name = "deterministic_panel_replay" if real else "deterministic_synthetic_replay"
@@ -317,7 +392,7 @@ def _replay(
         ok = False
         details.append(f"replay failed: {exc}")
 
-    _record(checks, name, ok, "; ".join(details))
+    _record(checks, name, ok, "; ".join(details) + env_note)
 
 
 def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
@@ -397,6 +472,52 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
             "rather than passed",
             applicable=False,
         )
+        panel_declared = (resolved.get("data") or {}).get("panel")
+        manifest_data = manifest.get("data") or {}
+        manifest_panel_hash = manifest_data.get("panel_sha256")
+        if manifest_panel_hash and panel_declared and Path(panel_declared).exists():
+            import hashlib
+            actual_panel_hash = hashlib.sha256(Path(panel_declared).read_bytes()).hexdigest()
+            _record(
+                checks,
+                "panel_sha256_matches",
+                actual_panel_hash == manifest_panel_hash,
+                f"actual={actual_panel_hash[:16]}... manifest={manifest_panel_hash[:16]}...",
+            )
+        elif not manifest_panel_hash:
+            _record(
+                checks,
+                "panel_sha256_matches",
+                False,
+                "panel_sha256 missing from manifest: this run predates panel hashing, so the panel "
+                "it consumed cannot be re-identified. Its saved artifact_verification.json records "
+                "the checks performed at creation; treat it as historical evidence, not a "
+                "re-verifiable artifact",
+            )
+        else:
+            _record(
+                checks,
+                "panel_sha256_matches",
+                False,
+                f"declared panel file not found: {panel_declared}",
+            )
+
+        try:
+            cutoffs = validate_cutoffs(resolved.get("cutoffs"))
+        except ValueError as exc:
+            try:
+                _, fallback_source = _effective_cutoffs(resolved)
+            except ValueError:
+                detail = str(exc)
+            else:
+                detail = (
+                    f"not frozen in this run's config ({exc}); replay could only use cutoffs "
+                    f"from {fallback_source}. Freezing began 2026-11-03, so this run predates it"
+                )
+            valid_cutoffs = False
+        else:
+            valid_cutoffs, detail = True, f"cutoffs={cutoffs}"
+        _record(checks, "effective_cutoffs_frozen", valid_cutoffs, detail)
 
     alpha_grid = list(resolved.get("alpha_grid", []))
     expected_models = set(resolved.get("models", [MODEL_HISTORICAL]))
@@ -505,23 +626,34 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
 
     # --- re-derive the series and replay --------------------------------------
     try:
-        sources, partitions = _rebuild_sources(resolved)
+        sources, partitions, rebuild_note = _rebuild_sources(resolved)
     except ArtifactVerificationError:
         raise
     except Exception as exc:  # noqa: BLE001
         _record(checks, "series_rebuild", False, f"could not rebuild the run series: {exc}")
-        sources, partitions = {}, None
+        sources, partitions, rebuild_note = {}, None, ""
     else:
         _record(
             checks,
             "series_rebuild",
             bool(sources),
-            f"splits={sorted(sources)} rebuilt from {'panel' if real else 'declared DGP'}",
+            rebuild_note or f"splits={sorted(sources)} rebuilt from {'panel' if real else 'declared DGP'}",
         )
 
     if sources and not forecasts.empty:
         _session_chain(checks, forecasts, sources, real)
-        _replay(checks, resolved, forecasts, oracle, sources, partitions, expected_models, alpha_grid, real)
+        _replay(
+            checks,
+            resolved,
+            forecasts,
+            oracle,
+            sources,
+            partitions,
+            expected_models,
+            alpha_grid,
+            real,
+            _environment_drift(manifest),
+        )
     elif sources:
         _record(checks, "replay_possible", False, "no forecast rows to replay")
 

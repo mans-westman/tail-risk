@@ -70,6 +70,23 @@ def _resolve_common(resolved: dict) -> dict:
     if unknown:
         raise ValueError(f"unsupported models: {unknown}; supported: {list(SUPPORTED_MODELS)}")
     resolved["models"] = models
+
+    declared_splits = resolved.get("splits")
+    if declared_splits is not None:
+        if not isinstance(declared_splits, (list, tuple)) or not declared_splits:
+            raise ValueError("'splits' must be a nonempty list of split names")
+        valid_splits = {"train", "validation", "test"}
+        unknown_splits = [s for s in declared_splits if s not in valid_splits]
+        if unknown_splits:
+            raise ValueError(
+                f"unknown split(s) in 'splits': {unknown_splits}; expected subset of {sorted(valid_splits)}"
+            )
+        if "train" not in declared_splits:
+            raise ValueError("declared 'splits' must include 'train' for model fitting")
+        resolved["splits"] = [s for s in ("train", "validation", "test") if s in declared_splits]
+    else:
+        resolved["splits"] = ["train", "validation", "test"]
+
     return resolved
 
 
@@ -82,7 +99,7 @@ def _resolve_synthetic(resolved: dict) -> dict:
         raise ValueError("dgp.nu is required for student_t innovation")
     if "partitions" not in resolved:
         raise ValueError("synthetic runs require 'partitions'")
-    for key in ("train", "validation", "test"):
+    for key in resolved.get("splits", ("train", "validation", "test")):
         if key not in resolved["partitions"]:
             raise ValueError(f"missing partition length: {key}")
         if not isinstance(resolved["partitions"][key], int) or resolved["partitions"][key] <= 0:
@@ -93,6 +110,8 @@ def _resolve_synthetic(resolved: dict) -> dict:
 
 
 def _resolve_panel(resolved: dict) -> dict:
+    from .data import validate_cutoffs
+
     data = resolved["data"]
     incompatible = [key for key in ("dgp", "partitions", "seeds") if key in resolved]
     if incompatible:
@@ -109,6 +128,27 @@ def _resolve_panel(resolved: dict) -> dict:
     unknown = sorted(set(data) - allowed)
     if unknown:
         raise ValueError(f"unknown data keys: {unknown}")
+
+    # Extract cutoffs directly from resolved or from data.audit
+    cutoffs = resolved.get("cutoffs")
+    if cutoffs is None and audit:
+        audit_path = Path(audit)
+        if not audit_path.exists():
+            raise ValueError(f"data.audit file does not exist: {audit}")
+        try:
+            audit_dict = json.loads(audit_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(f"data.audit is malformed JSON: {exc}") from exc
+        cutoffs = audit_dict.get("cutoffs") or audit_dict.get("splits", {}).get("cutoffs")
+
+    if cutoffs is None:
+        raise ValueError(
+            "real-panel runs require declared cutoffs ('train_end' and 'validation_end'), "
+            "provided directly or via data.audit"
+        )
+
+    # Freeze normalized ISO dates into the resolved configuration
+    resolved["cutoffs"] = validate_cutoffs(cutoffs)
     return resolved
 
 
@@ -160,6 +200,7 @@ def _manifest(config: dict, resolved: dict, start: float, status: str) -> dict:
         "config_hash_sha256": hashlib.sha256(
             json.dumps(resolved, sort_keys=True).encode("utf-8")
         ).hexdigest(),
+        "splits_executed": list(resolved.get("splits", ("train", "validation", "test"))),
         "platform": f"{platform.system()}-{platform.machine()}",
         "python": platform.python_version(),
         "dependencies": deps,
@@ -190,7 +231,10 @@ def _series_contexts(resolved: dict, series_map: dict) -> list[SeriesContext]:
     """Build contexts for either synthetic partitions or a validated real panel."""
     contexts: list[SeriesContext] = []
     seeds = resolved.get("seeds", {})
+    allowed_splits = set(resolved.get("splits", ("train", "validation", "test")))
     for split, series in series_map.items():
+        if split not in allowed_splits:
+            continue
         returns = np.asarray(series.returns, dtype=float)
         if hasattr(series, "scored_origin_indices"):  # PanelSplit
             contexts.append(
@@ -324,8 +368,11 @@ def _oracle_rows(resolved: dict, series_map: dict) -> list[dict]:
         return []
     alpha_grid = resolved["alpha_grid"]
     dataset_id = resolved.get("dataset_id", "synthetic")
+    allowed_splits = set(resolved.get("splits", ("train", "validation", "test")))
     rows: list[dict] = []
     for name, path in series_map.items():
+        if name not in allowed_splits:
+            continue
         series_id = f"{dataset_id}_{name}"
         for origin in range(path.returns.size - 1):
             target = origin + 1
@@ -351,20 +398,28 @@ def _load_run_series(resolved: dict) -> tuple[dict, dict]:
         from .data import DataError, load_panel
 
         panel_path = Path(resolved["data"]["panel"])
+        if not panel_path.exists():
+            raise ValueError(f"panel file not found: {panel_path}")
+        panel_bytes = panel_path.read_bytes()
+        panel_sha256 = hashlib.sha256(panel_bytes).hexdigest()
+
+        audit_path = resolved["data"].get("audit")
+        protocol = {"cutoffs": resolved["cutoffs"]} if resolved.get("cutoffs") else None
+
         try:
-            series_map = load_panel(panel_path)
+            series_map = load_panel(panel_path, protocol=protocol)
         except (DataError, OSError) as exc:
             raise ValueError(f"panel unusable: {exc}") from exc
         info: dict = {
             "kind": resolved["data_kind"],
             "panel": str(panel_path.resolve()),
             "panel_declared": str(panel_path),
+            "panel_sha256": panel_sha256,
             "splits": {
                 name: {"returns": int(part.returns.size), "scored_origins": len(part.scored_origin_indices)}
                 for name, part in series_map.items()
             },
         }
-        audit_path = resolved["data"].get("audit")
         if audit_path:
             try:
                 audit = json.loads(Path(audit_path).read_text(encoding="utf-8"))
@@ -381,9 +436,12 @@ def _load_run_series(resolved: dict) -> tuple[dict, dict]:
                 raise ValueError(f"data audit unreadable: {exc}") from exc
         return series_map, info
 
+    allowed_splits = set(resolved.get("splits", ("train", "validation", "test")))
+    part_lengths = {k: v for k, v in resolved["partitions"].items() if k in allowed_splits}
+    part_seeds = {k: v for k, v in resolved["seeds"].items() if k in allowed_splits}
     partitions = generate_partitions(
-        resolved["partitions"],
-        resolved["seeds"],
+        part_lengths,
+        part_seeds,
         **resolved["dgp"],
         alphas=resolved["alpha_grid"],
     )
@@ -465,6 +523,11 @@ def _data_checks(resolved: dict, contexts: list[SeriesContext], forecasts: list[
 
 def cmd_run(config_path: str, output: str) -> int:
     start = time.perf_counter()
+    out_dir = Path(output)
+    if out_dir.exists() and (not out_dir.is_dir() or any(out_dir.iterdir())):
+        print(f"run failed: output path is not an empty directory: {out_dir}; "
+              "choose a fresh output directory to preserve prior evidence", file=sys.stderr)
+        return 2
     try:
         config = _load_config(Path(config_path))
         resolved = _resolve_config(config)
@@ -478,7 +541,6 @@ def cmd_run(config_path: str, output: str) -> int:
         print(f"run failed: {exc}", file=sys.stderr)
         return 2
 
-    out_dir = Path(output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     contexts = _series_contexts(resolved, series_map)

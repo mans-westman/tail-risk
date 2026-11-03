@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from .conventions import SUPPORTED_ALPHA_MAX
+
 METRICS_COLUMNS = [
     "series_id", "split", "model_id", "alpha", "n",
     "n_available", "n_failed_rows", "n_invalid_output", "n_dropped_by_mask",
@@ -200,7 +202,17 @@ def _empty_metrics() -> pd.DataFrame:
 
 def _validate_forecast_rows(df: pd.DataFrame) -> None:
     """Reject saved forecasts that cannot support an ordered, keyed comparison."""
-    required = {"series_id", "model_id", "alpha", "origin_date", "var", "es", "status"}
+    required = {
+        "series_id",
+        "model_id",
+        "alpha",
+        "origin_date",
+        "target_date",
+        "realized_return",
+        "var",
+        "es",
+        "status",
+    }
     missing = sorted(required - set(df.columns))
     if missing:
         raise EvaluationError(f"forecasts are missing required columns: {missing}")
@@ -214,8 +226,56 @@ def _validate_forecast_rows(df: pd.DataFrame) -> None:
             f"e.g. {examples}; forecasts must hold one row per key"
         )
 
-    if "target_date" not in df.columns:
-        return
+    # Validate supported alpha values: finite and in (0, SUPPORTED_ALPHA_MAX)
+    alphas = pd.to_numeric(df["alpha"], errors="coerce")
+    invalid_alphas = df.loc[
+        alphas.isna() | (alphas <= 0.0) | (alphas >= SUPPORTED_ALPHA_MAX), "alpha"
+    ].unique().tolist()
+    if invalid_alphas:
+        raise EvaluationError(
+            f"unsupported alpha values: {invalid_alphas}; expected finite values in (0, {SUPPORTED_ALPHA_MAX})"
+        )
+
+    # Shared realized targets: all models and alpha levels for each (series_id, origin_date)
+    # must refer to the exact same target date and realized return.
+    target_counts = df.groupby(["series_id", "origin_date"], sort=False)["target_date"].nunique()
+    inconsistent_targets = target_counts[target_counts > 1]
+    if not inconsistent_targets.empty:
+        examples = []
+        for (s_id, o_date) in inconsistent_targets.index[:3]:
+            distinct = sorted(
+                df.loc[
+                    (df["series_id"] == s_id) & (df["origin_date"] == o_date), "target_date"
+                ].astype(str).unique()
+            )
+            examples.append({"series_id": s_id, "origin_date": o_date, "target_dates": distinct})
+        raise EvaluationError(
+            f"inconsistent target dates for the same origin across models/alphas: {examples}; "
+            "all models and alphas for an origin must forecast the same target session"
+        )
+
+    realized_nums = pd.to_numeric(df["realized_return"], errors="coerce")
+    if realized_nums.isna().any():
+        bad = df.loc[realized_nums.isna(), ["series_id", "origin_date", "realized_return"]].head(3).to_dict("records")
+        raise EvaluationError(f"non-numeric realized_return values: {bad}")
+    ret_ranges = (
+        df.assign(_ret=realized_nums)
+        .groupby(["series_id", "origin_date"], sort=False)["_ret"]
+        .agg(lambda s: float(s.max() - s.min()))
+    )
+    inconsistent_rets = ret_ranges[ret_ranges > 1e-8]
+    if not inconsistent_rets.empty:
+        examples = []
+        for (s_id, o_date) in inconsistent_rets.index[:3]:
+            vals = df.loc[
+                (df["series_id"] == s_id) & (df["origin_date"] == o_date), "realized_return"
+            ].unique().tolist()
+            examples.append({"series_id": s_id, "origin_date": o_date, "realized_returns": vals})
+        raise EvaluationError(
+            f"inconsistent realized returns for the same origin across models/alphas: {examples}; "
+            "all models and alphas for an origin must evaluate against the identical realized return"
+        )
+
     for series_id, group in df.groupby("series_id", sort=False):
         has_target = group["target_date"].notna()
         if not has_target.any():
@@ -287,7 +347,10 @@ def evaluate_forecasts(
     finite = (
         np.isfinite(df["var"]) & np.isfinite(df["es"]) & np.isfinite(df["realized_return"])
     )
-    admissible = finite & (df["es"] < 0.0)
+    # The full supported contract requires es <= var < 0.
+    # While FZ0 mathematically requires only es < 0, our project's valid forecast contract
+    # requires Expected Shortfall to be at least as severe as VaR, with negative return risk.
+    admissible = finite & (df["es"] <= df["var"]) & (df["var"] < 0.0)
     df["scorable"] = ok & admissible
 
     oracle_str = oracle.copy()
@@ -385,10 +448,13 @@ def evaluate_forecasts(
         e = scored["es"].to_numpy(dtype=float)
 
         # A pair counts as a Markov transition only when the two origins are
-        # consecutive sessions in the series' observed sequence; mask gaps and data
-        # gaps break the chain instead of joining non-adjacent days.
-        chrono = scored["_chrono"].to_numpy(dtype=int)
-        consecutive = np.diff(chrono) == 1
+        # genuinely consecutive sessions in the series' observed sequence:
+        # the target of observation i must match the origin of observation i+1.
+        # This prevents dropped or absent origins (e.g. origins [0, 2] targeting [1, 3])
+        # from falsely counting as adjacent transitions merely because their ranks are adjacent.
+        prev_targets = _chronology_key(scored["target_date"].iloc[:-1]).to_numpy()
+        curr_origins = _chronology_key(scored["origin_date"].iloc[1:]).to_numpy()
+        consecutive = np.isclose(prev_targets, curr_origins, atol=1e-8, rtol=0.0)
 
         fz0 = np.array([fz0_loss(yi, vi, ei, alpha) for yi, vi, ei in zip(y, v, e)])
         qloss = np.array([quantile_loss(yi, vi, alpha) for yi, vi in zip(y, v)])

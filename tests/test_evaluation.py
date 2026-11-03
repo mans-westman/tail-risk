@@ -254,6 +254,7 @@ def test_evaluate_orders_transitions_chronologically_not_lexicographically():
             "series_id": ["ds_test"] * 5,
             "model_id": ["m"] * 5,
             "origin_date": origins,
+            "target_date": [o + 1 for o in origins],
             "alpha": [0.025] * 5,
             "var": var,
             "es": [-0.03] * 5,
@@ -305,11 +306,13 @@ def test_evaluate_uses_common_mask_across_models():
 
 
 def test_evaluate_counts_inadmissible_outputs_and_keeps_empty_cells():
+    origins = ["0", "1", "2", "10", "11", "12"]
     forecasts = pd.DataFrame(
         {
             "series_id": ["ds_test"] * 6,
             "model_id": ["model_a"] * 3 + ["model_b"] * 3,
-            "origin_date": ["0", "1", "2", "10", "11", "12"],
+            "origin_date": origins,
+            "target_date": [str(int(o) + 1) for o in origins],
             "alpha": [0.025] * 6,
             "var": [-0.02] * 6,
             "es": [-0.03, -0.03, 0.01, -0.03, -0.03, -0.03],
@@ -336,6 +339,7 @@ def test_evaluate_reports_models_that_failed_entirely():
             "series_id": ["ds_test"] * 6,
             "model_id": ["model_a"] * 3 + ["model_b"] * 3,
             "origin_date": ["0", "1", "2"] * 2,
+            "target_date": ["1", "2", "3"] * 2,
             "alpha": [0.025] * 6,
             "var": [-0.02] * 6,
             "es": [-0.03] * 6,
@@ -457,3 +461,86 @@ def test_evaluate_cli_fails_when_a_configured_model_wrote_nothing(tmp_path):
 
     assert cmd_evaluate(str(out_dir)) == 2
     assert not (out_dir / "metrics.csv").exists()
+
+
+def test_evaluate_rejects_inconsistent_target_dates_across_models():
+    from tailrisk.evaluation import EvaluationError
+
+    forecasts = pd.DataFrame(
+        [
+            {"series_id": "s_test", "model_id": "m1", "alpha": 0.025, "origin_date": "0", "target_date": "1", "realized_return": 0.01, "var": -0.02, "es": -0.03, "status": "ok"},
+            {"series_id": "s_test", "model_id": "m2", "alpha": 0.025, "origin_date": "0", "target_date": "2", "realized_return": 0.01, "var": -0.02, "es": -0.03, "status": "ok"},
+        ]
+    )
+    with pytest.raises(EvaluationError, match="inconsistent target dates"):
+        evaluate_forecasts(forecasts, pd.DataFrame(), "s")
+
+
+def test_evaluate_rejects_inconsistent_realized_returns_across_models():
+    from tailrisk.evaluation import EvaluationError
+
+    forecasts = pd.DataFrame(
+        [
+            {"series_id": "s_test", "model_id": "m1", "alpha": 0.025, "origin_date": "0", "target_date": "1", "realized_return": 0.01, "var": -0.02, "es": -0.03, "status": "ok"},
+            {"series_id": "s_test", "model_id": "m2", "alpha": 0.025, "origin_date": "0", "target_date": "1", "realized_return": 0.02, "var": -0.02, "es": -0.03, "status": "ok"},
+        ]
+    )
+    with pytest.raises(EvaluationError, match="inconsistent realized returns"):
+        evaluate_forecasts(forecasts, pd.DataFrame(), "s")
+
+
+def test_evaluate_rejects_unsupported_alpha_values():
+    from tailrisk.evaluation import EvaluationError
+
+    forecasts = _frame(
+        [
+            {"series_id": "s_test", "model_id": "m", "origin_date": 0, "target_date": 1, "realized_return": 0.01, "alpha": 0.60},
+        ]
+    )
+    with pytest.raises(EvaluationError, match="unsupported alpha values"):
+        evaluate_forecasts(forecasts, pd.DataFrame(), "s")
+
+
+def test_evaluate_enforces_strict_es_le_var_admissibility():
+    """es > var violates coherent tail risk ordering; must be flagged as invalid output."""
+    forecasts = _frame(
+        [
+            # Invalid output: var = -0.05, es = -0.01 (es > var)
+            {"series_id": "s_test", "model_id": "m", "origin_date": 0, "target_date": 1, "realized_return": 0.01, "var": -0.05, "es": -0.01},
+            # Valid output
+            {"series_id": "s_test", "model_id": "m", "origin_date": 1, "target_date": 2, "realized_return": 0.01, "var": -0.02, "es": -0.04},
+        ]
+    )
+    metrics = evaluate_forecasts(forecasts, pd.DataFrame(), "s")
+    row = metrics.iloc[0]
+    assert row["n_available"] == 2
+    assert row["n_invalid_output"] == 1
+    assert row["n"] == 1
+
+
+def test_evaluate_true_transition_adjacency_with_skipped_origins():
+    """Origins [0, 2] targeting [1, 3] do NOT form a transition because origin 1 is skipped."""
+    forecasts_skipped = _frame(
+        [
+            {"series_id": "s_test", "model_id": "m", "origin_date": 0, "target_date": 1, "realized_return": -0.03},
+            {"series_id": "s_test", "model_id": "m", "origin_date": 2, "target_date": 3, "realized_return": -0.03},
+        ]
+    )
+    metrics_skipped = evaluate_forecasts(forecasts_skipped, pd.DataFrame(), "s")
+    row_skip = metrics_skipped.iloc[0]
+    assert row_skip["n"] == 2
+    assert row_skip["n_transitions"] == 0
+    assert row_skip["n_chain_breaks"] == 1
+
+    # In contrast, consecutive origins [0, 1] form exactly 1 transition
+    forecasts_adj = _frame(
+        [
+            {"series_id": "s_test", "model_id": "m", "origin_date": 0, "target_date": 1, "realized_return": -0.03},
+            {"series_id": "s_test", "model_id": "m", "origin_date": 1, "target_date": 2, "realized_return": -0.03},
+        ]
+    )
+    metrics_adj = evaluate_forecasts(forecasts_adj, pd.DataFrame(), "s")
+    row_adj = metrics_adj.iloc[0]
+    assert row_adj["n"] == 2
+    assert row_adj["n_transitions"] == 1
+    assert row_adj["n_chain_breaks"] == 0

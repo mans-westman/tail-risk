@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "run_id": "sp500-dev-20261103",
+  "dataset_id": "sp500_price_index",
+  "splits": ["train", "validation"],
+  "data": {
+    "kind": "returns_panel",
+    "panel": "data/sp500/panel.csv",
+    "audit": "data/sp500/data_audit.json"
+  },
+  "alpha_grid": [0.005, 0.01, 0.025, 0.05, 0.1, 0.2],
+  "historical_window": 100,
+  "models": ["historical_simulation", "garch_student_t"],
+  "protocol": "Train and validation only for model development. Test split excluded from forecasting and evaluation until final evaluation authorization."
+}

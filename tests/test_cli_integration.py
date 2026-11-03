@@ -25,6 +25,7 @@ def test_smoke_run_and_verify(tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
     out_dir = tmp_path / "out"
+    out_dir.mkdir()  # An explicitly prepared, empty destination is supported.
 
     exit_code = cmd_run(str(config_path), str(out_dir))
     assert exit_code == 0, "run should pass offline checks"
@@ -95,3 +96,24 @@ def test_run_rejects_bad_config(tmp_path, capsys):
 @pytest.mark.integration
 def test_verify_missing_run_dir(tmp_path):
     assert cmd_verify(str(tmp_path / "nonexistent")) == 2
+
+
+@pytest.mark.parametrize("existing_file", [False, True])
+def test_run_preserves_existing_outputs_before_loading_data(tmp_path, monkeypatch, capsys, existing_file):
+    from tailrisk import cli
+
+    output = tmp_path / "reviewed_run"
+    if not existing_file:
+        output.mkdir()
+    marker = output if existing_file else output / "forecasts.csv"
+    marker.write_bytes(b"reviewed evidence\n")
+
+    def unexpected_load(*args):
+        pytest.fail("rejected output path must not trigger data loading")
+
+    monkeypatch.setattr(cli, "_load_run_series", unexpected_load)
+    assert cmd_run("configs/smoke.json", str(output)) == 2
+    assert marker.read_bytes() == b"reviewed evidence\n"
+    assert "fresh output directory" in capsys.readouterr().err
+    if not existing_file:
+        assert list(output.iterdir()) == [marker]

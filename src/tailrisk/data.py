@@ -22,6 +22,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import date
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
@@ -73,6 +74,33 @@ DEFAULT_LONG_GAP_DAYS = 4
 
 class DataError(RuntimeError):
     """Raised when a snapshot is invalid, ambiguous, or insufficient for the protocol."""
+
+
+def validate_cutoffs(cutoffs: Any) -> dict[str, str]:
+    """Validate date-only protocol boundaries without inferring epoch timestamps."""
+    if not isinstance(cutoffs, dict):
+        raise ValueError("cutoffs missing or not an object/dict")
+    missing = {"train_end", "validation_end"} - set(cutoffs)
+    if missing:
+        raise ValueError(f"cutoffs missing required key(s): {sorted(missing)}")
+    normalized = {}
+    for key in ("train_end", "validation_end"):
+        value = cutoffs[key]
+        try:
+            if not isinstance(value, str) or len(value) != 10:
+                raise ValueError
+            parsed = date.fromisoformat(value)
+            if parsed.isoformat() != value:
+                raise ValueError
+        except ValueError:
+            raise ValueError(
+                f"cutoffs contain an unparseable date: {key}={value!r}; "
+                "expected a YYYY-MM-DD calendar-date string"
+            ) from None
+        normalized[key] = parsed.isoformat()
+    if normalized["train_end"] >= normalized["validation_end"]:
+        raise ValueError("cutoffs must satisfy train_end < validation_end")
+    return normalized
 
 
 def sha256_hex(payload: bytes) -> str:
@@ -175,11 +203,23 @@ def validate_closes(
     if null_dates:
         raise DataError(f"{null_dates} rows have an unparseable session date")
 
+    null_closes = int(clean["close"].isna().sum())
+    if null_closes > 0:
+        bad_dates = (
+            clean.loc[clean["close"].isna(), "session_date"]
+            .dt.strftime("%Y-%m-%d")
+            .head(3)
+            .tolist()
+        )
+        raise DataError(
+            f"{null_closes} row(s) have missing/null closes (e.g. {bad_dates}); "
+            "missing close observations must be rejected rather than silently dropped and bridged"
+        )
+
     findings: dict[str, Any] = {
         "rows_received": int(len(clean)),
-        "dropped_null_close": int(clean["close"].isna().sum()),
+        "dropped_null_close": 0,
     }
-    clean = clean.loc[clean["close"].notna()].copy()
     if clean.empty:
         raise DataError("no usable closes remain after dropping null values")
 
@@ -206,6 +246,9 @@ def validate_closes(
     if not invalid.empty:
         dates = invalid["session_date"].dt.strftime("%Y-%m-%d").head(3).tolist()
         raise DataError(f"non-positive or non-finite closes on {dates}")
+
+    if clean["close"].nunique() <= 1 and len(clean) > 1:
+        raise DataError("close series is wholly constant")
 
     elapsed = clean["session_date"].diff().dt.days
     gaps = clean.loc[elapsed > long_gap_days, ["session_date"]].copy()
@@ -258,6 +301,9 @@ def closes_to_log_returns(
     bad = frame_out.loc[~np.isfinite(frame_out["return"])]
     if not bad.empty:
         raise DataError(f"non-finite returns on {bad['session_date'].head(3).tolist()}")
+    rets = frame_out["return"].to_numpy(dtype=float)
+    if rets.size > 0 and (np.all(rets == rets[0]) or float(np.max(rets) - np.min(rets)) <= 1e-12):
+        raise DataError("return series is wholly constant/zero (degenerate series); cannot forecast tail risk")
     return frame_out.reset_index(drop=True)
 
 
@@ -284,6 +330,9 @@ def normalise_returns(frame: pd.DataFrame, *, units: str) -> pd.DataFrame:
         raise DataError("return frame contains unparseable dates or non-numeric returns")
     if out["session_date"].duplicated().any():
         raise DataError("duplicate session dates in return frame")
+    rets = out["return"].to_numpy(dtype=float)
+    if rets.size > 0 and (np.all(rets == rets[0]) or float(np.max(rets) - np.min(rets)) <= 1e-12):
+        raise DataError("return series is wholly constant/zero (degenerate series); cannot forecast tail risk")
     out = out.sort_values("session_date").reset_index(drop=True)
     out.attrs["declared_units"] = units
     return out
@@ -700,12 +749,14 @@ class PanelSplit:
             raise DataError(f"{self.split}: target dates and returns are misaligned")
 
 
-def load_panel(path: str | Path) -> dict[str, PanelSplit]:
+def load_panel(path: str | Path, protocol: dict[str, Any] | None = None) -> dict[str, PanelSplit]:
     """Rebuild per-split return arrays from a panel, re-verifying its invariants.
 
     The panel is an input that could be edited, so nothing is taken on trust: session
     chaining, return alignment, position ordering and the scored-origin set are all
     re-checked here, and a violation is an error rather than a quietly shifted window.
+    When ``protocol`` is provided (e.g. from data_audit.json or config cutoffs),
+    scored target dates are strictly validated against declared boundaries.
     """
     frame = pd.read_csv(path)
     missing = [column for column in REQUIRED_PANEL_COLUMNS if column not in frame.columns]
@@ -713,6 +764,12 @@ def load_panel(path: str | Path) -> dict[str, PanelSplit]:
         raise DataError(f"panel is missing columns: {missing}")
     if frame.empty:
         raise DataError("panel contains no rows")
+
+    unknown_splits = sorted(set(frame["split"].astype(str)) - set(SPLIT_ORDER))
+    if unknown_splits:
+        raise DataError(
+            f"panel contains unknown split label(s): {unknown_splits}; expected subset of {SPLIT_ORDER}"
+        )
 
     frame = frame.copy()
     frame["origin_position"] = pd.to_numeric(frame["origin_position"], errors="coerce")
@@ -724,6 +781,20 @@ def load_panel(path: str | Path) -> dict[str, PanelSplit]:
     for column in ("origin_date", "target_date"):
         frame[column] = frame[column].astype(str)
     frame["is_scored"] = frame["is_scored"].astype(str).str.lower().isin(("true", "1"))
+
+    # Reject wholly constant/zero return series across the panel (degenerate case)
+    realized_all = frame["realized_return"].to_numpy(dtype=float)
+    if realized_all.size > 0 and (
+        np.all(realized_all == realized_all[0])
+        or float(np.max(realized_all) - np.min(realized_all)) <= 1e-12
+    ):
+        raise DataError("panel returns are wholly constant/zero (degenerate series); cannot forecast tail risk")
+
+    # Dates must parse as chronological session dates
+    parsed_origins = pd.to_datetime(frame["origin_date"], errors="coerce")
+    parsed_targets = pd.to_datetime(frame["target_date"], errors="coerce")
+    if parsed_origins.isna().any() or parsed_targets.isna().any():
+        raise DataError("panel contains unparseable dates in origin_date or target_date")
 
     splits: dict[str, PanelSplit] = {}
     for split, block in frame.groupby("split", sort=False):
@@ -741,6 +812,33 @@ def load_panel(path: str | Path) -> dict[str, PanelSplit]:
                 raise DataError(
                     f"{split}: session chain breaks between {origin_dates[index]} and {target}"
                 )
+
+        # Within-split chronology: session dates must advance forward in time
+        block_origins = pd.to_datetime(block["origin_date"])
+        block_targets = pd.to_datetime(block["target_date"])
+        if (block_targets <= block_origins).any():
+            offenders = (
+                block.loc[block_targets <= block_origins, ["origin_date", "target_date"]]
+                .head(3)
+                .to_dict(orient="records")
+            )
+            raise DataError(
+                f"{split}: target_date must be strictly after origin_date; found {offenders}"
+            )
+
+        if len(block) > 1:
+            origin_diffs = block_origins.diff().iloc[1:]
+            if (origin_diffs <= pd.Timedelta(0)).any():
+                raise DataError(f"{split}: origin_date must be strictly increasing; found non-advancing dates")
+            target_diffs = block_targets.diff().iloc[1:]
+            if (target_diffs <= pd.Timedelta(0)).any():
+                raise DataError(f"{split}: target_date must be strictly increasing; found non-advancing dates")
+
+        parsed_split_sessions = pd.to_datetime(origin_dates)
+        if len(parsed_split_sessions) > 1:
+            session_diffs = pd.Series(parsed_split_sessions).diff().iloc[1:]
+            if (session_diffs <= pd.Timedelta(0)).any():
+                raise DataError(f"{split}: session dates must be strictly increasing chronological dates")
 
         realized = block["realized_return"].to_numpy(dtype=float)
         origin_returns = block["origin_return"].to_numpy(dtype=float)
@@ -784,6 +882,103 @@ def load_panel(path: str | Path) -> dict[str, PanelSplit]:
         raise DataError("panel contains no recognised splits")
     if "train" not in splits:
         raise DataError("panel has no train split; model fitting requires one")
+
+    # Scored target dates per split
+    scored_targets_by_split: dict[str, list[str]] = {}
+    for split in SPLIT_ORDER:
+        if split not in splits:
+            continue
+        block = frame[frame["split"] == split]
+        scored_targets_by_split[split] = block.loc[block["is_scored"], "target_date"].tolist()
+
+    # Check that scored target dates do not overlap across splits
+    all_scored_sets = [(s, set(targets)) for s, targets in scored_targets_by_split.items() if targets]
+    for i in range(len(all_scored_sets)):
+        for j in range(i + 1, len(all_scored_sets)):
+            s_i, targets_i = all_scored_sets[i]
+            s_j, targets_j = all_scored_sets[j]
+            overlap = targets_i.intersection(targets_j)
+            if overlap:
+                raise DataError(
+                    f"scored targets overlap between {s_i} and {s_j} on dates: {sorted(overlap)[:3]}"
+                )
+
+    # Check strict chronological order of splits in SPLIT_ORDER
+    prev_split = None
+    prev_max_target = None
+    for split in SPLIT_ORDER:
+        targets = scored_targets_by_split.get(split, [])
+        if not targets:
+            continue
+        min_target = min(targets)
+        max_target = max(targets)
+        if prev_max_target is not None and min_target <= prev_max_target:
+            raise DataError(
+                f"split {split} scored targets start at {min_target}, which does not follow "
+                f"preceding split {prev_split} (ended at {prev_max_target}); splits must be chronological"
+            )
+        prev_split = split
+        prev_max_target = max_target
+
+    # Consistent dates and returns wherever causal context overlaps across splits
+    date_return_map: dict[tuple[str, str], tuple[float, float, str]] = {}
+    for split in SPLIT_ORDER:
+        if split not in splits:
+            continue
+        block = frame[frame["split"] == split]
+        for row in block.itertuples(index=False):
+            key = (str(row.origin_date), str(row.target_date))
+            o_ret = float(row.origin_return)
+            r_ret = float(row.realized_return)
+            if key in date_return_map:
+                prev_o, prev_r, prev_s = date_return_map[key]
+                if abs(o_ret - prev_o) > 1e-8 or abs(r_ret - prev_r) > 1e-8:
+                    raise DataError(
+                        f"inconsistent context returns between {split} and {prev_s} on {key}: "
+                        f"({o_ret}, {r_ret}) vs ({prev_o}, {prev_r})"
+                    )
+            else:
+                date_return_map[key] = (o_ret, r_ret, split)
+
+    # Validate protocol cutoffs if provided
+    if protocol is not None:
+        try:
+            cutoffs = validate_cutoffs(protocol.get("cutoffs"))
+        except ValueError as exc:
+            raise DataError(str(exc)) from exc
+        train_end = cutoffs.get("train_end")
+        validation_end = cutoffs.get("validation_end")
+        if train_end and "train" in splits:
+            train_block = frame[frame["split"] == "train"]
+            late_train = [t for t in train_block["target_date"] if t > train_end]
+            if late_train:
+                raise DataError(
+                    f"train has observations after train_end {train_end} (including unscored rows supplied to fitting): e.g. {late_train[:3]}"
+                )
+            late_train_origins = [d for d in train_block["origin_date"] if d > train_end]
+            if late_train_origins:
+                raise DataError(
+                    f"train has origin dates after train_end {train_end}: e.g. {late_train_origins[:3]}"
+                )
+        if train_end and "validation" in scored_targets_by_split:
+            early_val = [t for t in scored_targets_by_split["validation"] if t <= train_end]
+            if early_val:
+                raise DataError(
+                    f"validation has scored targets on or before train_end {train_end}: e.g. {early_val[:3]}"
+                )
+        if validation_end and "validation" in scored_targets_by_split:
+            late_val = [t for t in scored_targets_by_split["validation"] if t > validation_end]
+            if late_val:
+                raise DataError(
+                    f"validation has scored targets after validation_end {validation_end}: e.g. {late_val[:3]}"
+                )
+        if validation_end and "test" in scored_targets_by_split:
+            early_test = [t for t in scored_targets_by_split["test"] if t <= validation_end]
+            if early_test:
+                raise DataError(
+                    f"test has scored targets on or before validation_end {validation_end}: e.g. {early_test[:3]}"
+                )
+
     return splits
 
 
