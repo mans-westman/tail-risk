@@ -36,9 +36,29 @@ FORECAST_COLUMNS = [
     "status",
 ]
 
+#: One row per failed forecast: the key of the row it accompanies, plus the reason. Kept
+#: in its own artifact so the forecast schema stays stable for every existing reader.
+FAILURE_COLUMNS = [
+    "run_id",
+    "dataset_id",
+    "series_id",
+    "model_id",
+    "origin_date",
+    "target_date",
+    "alpha",
+    "scale",
+    "reason",
+]
+
 MODEL_HISTORICAL = "historical_simulation"
 MODEL_GARCH_T = "garch_student_t"
-SUPPORTED_MODELS = (MODEL_HISTORICAL, MODEL_GARCH_T)
+MODEL_JOINT_MLP = "joint_mlp"
+SUPPORTED_MODELS = (MODEL_HISTORICAL, MODEL_GARCH_T, MODEL_JOINT_MLP)
+
+#: Budget keys a config's ``mlp`` block may override; everything else is a trainer default.
+MLP_BUDGET_KEYS = ("learning_rate", "batch_size", "max_grad_norm", "max_epochs", "patience")
+MLP_KEYS = ("model_seed",) + MLP_BUDGET_KEYS
+MLP_CHECKPOINT_RELATIVE = "checkpoints/joint_mlp"
 
 
 def _load_config(path: Path) -> dict:
@@ -87,6 +107,40 @@ def _resolve_common(resolved: dict) -> dict:
     else:
         resolved["splits"] = ["train", "validation", "test"]
 
+    return resolved
+
+
+def _resolve_mlp(resolved: dict) -> dict:
+    """Validate the ``mlp`` block and freeze the resolved training settings.
+
+    The block may only shrink or restate the trainer's defaults; an unknown key is an error
+    so a typo cannot silently leave the default budget in force. Validation-based
+    checkpoint selection is part of the model, so a run without a validation split is
+    refused rather than quietly trained to a fixed epoch count.
+    """
+    block = resolved.get("mlp")
+    if MODEL_JOINT_MLP not in resolved["models"]:
+        if block is not None:
+            raise ValueError("config declares an 'mlp' block but 'joint_mlp' is not in models")
+        return resolved
+    if block is None:
+        block = {}
+    if not isinstance(block, dict):
+        raise ValueError("'mlp' must be a JSON object")
+    unknown = sorted(set(block) - set(MLP_KEYS))
+    if unknown:
+        raise ValueError(f"unknown mlp keys: {unknown}; allowed: {list(MLP_KEYS)}")
+    if "validation" not in resolved["splits"]:
+        raise ValueError(
+            "joint_mlp selects its checkpoint on validation rows; add 'validation' to 'splits'"
+        )
+    seed = block.get("model_seed", 0)
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("mlp.model_seed must be a non-negative integer")
+    resolved["mlp"] = {
+        "model_seed": int(seed),
+        **{key: block[key] for key in MLP_BUDGET_KEYS if key in block},
+    }
     return resolved
 
 
@@ -166,6 +220,7 @@ def _resolve_config(config: dict) -> dict:
     resolved["data_kind"] = kind
     resolved["dataset_kind"] = "real" if kind == DATASET_PANEL else "synthetic"
     resolved = _resolve_common(resolved)
+    resolved = _resolve_mlp(resolved)
     if kind == DATASET_PANEL:
         return _resolve_panel(resolved)
     if "dgp" not in resolved:
@@ -362,6 +417,85 @@ def _garch_rows(resolved: dict, contexts: list[SeriesContext]) -> tuple[list[dic
     return rows, model.summary()
 
 
+def _mlp_rows(
+    resolved: dict, contexts: list[SeriesContext], out_dir: Path
+) -> tuple[list[dict], dict]:
+    """Joint-MLP rows: fit on train rows, select on validation rows, checkpoint, predict.
+
+    Only contexts the protocol allows are present in ``contexts``, so a development run
+    (``splits: ["train", "validation"]``) never hands a test-period observation to the
+    model. Each split is prepared independently from its own returns array, which starts
+    with the trailing history the panel permits, so features at the first origins of a
+    split can use earlier sessions without their targets entering any fitting array.
+    """
+    from .models.joint_mlp_model import JointMlpModel, prepare_split
+
+    alpha_grid = resolved["alpha_grid"]
+    run_id = resolved.get("run_id", "run")
+    dataset_id = resolved.get("dataset_id", "synthetic")
+    settings = resolved["mlp"]
+
+    samples = {
+        context.split: prepare_split(
+            split=context.split,
+            series_id=context.series_id,
+            returns=context.returns,
+            origin_labels=context.origin_labels,
+            target_labels=context.target_labels,
+            allowed_origins=context.allowed_origins,
+        )
+        for context in contexts
+    }
+    if "train" not in samples:
+        raise ValueError("joint_mlp requires a train split")
+    if "validation" not in samples:
+        raise ValueError("joint_mlp requires a validation split for checkpoint selection")
+
+    model = JointMlpModel(
+        model_seed=settings["model_seed"],
+        alphas=alpha_grid,
+        budget={key: value for key, value in settings.items() if key != "model_seed"},
+    )
+    try:
+        model.fit_partitions(samples["train"], samples["validation"])
+    except ModuleNotFoundError as exc:  # jax/optax live in the optional 'neural' extra
+        raise ValueError(
+            "joint_mlp requires the 'neural' extra (jax, optax); "
+            "install it with: python -m pip install -e '.[dev,neural]'"
+        ) from exc
+
+    rows: list[dict] = []
+    for context in contexts:
+        prepared = samples[context.split]
+        for forecast in model.predict_split(prepared, np.asarray(alpha_grid, dtype=float)):
+            origin = int(forecast.origin_index)
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "dataset_id": dataset_id,
+                    "series_id": context.series_id,
+                    "model_id": MODEL_JOINT_MLP,
+                    "data_seed": context.data_seed,
+                    "model_seed": int(settings["model_seed"]),
+                    "origin_date": context.origin_labels[origin],
+                    "target_date": context.target_labels[origin],
+                    "alpha": float(forecast.alpha),
+                    "var": float(forecast.var),
+                    "es": float(forecast.es),
+                    "scale": float(forecast.scale),
+                    "realized_return": float(context.returns[origin + 1]),
+                    "status": forecast.status,
+                    # Serialized to failures.csv, never to forecasts.csv (FORECAST_COLUMNS).
+                    "_failure_reason": (forecast.info or {}).get("reason", ""),
+                }
+            )
+
+    record = model.save_checkpoint(out_dir / MLP_CHECKPOINT_RELATIVE)
+    record["path"] = MLP_CHECKPOINT_RELATIVE
+    model.record_checkpoint(record)
+    return rows, model.summary()
+
+
 def _oracle_rows(resolved: dict, series_map: dict) -> list[dict]:
     """Oracle curves exist only for synthetic paths; real panels have no ground truth."""
     if resolved.get("dataset_kind") == "real":
@@ -554,7 +688,11 @@ def cmd_run(config_path: str, output: str) -> int:
                 garch_rows, garch_summary = _garch_rows(resolved, contexts)
                 forecasts.extend(garch_rows)
                 fit_info[MODEL_GARCH_T] = garch_summary
-    except ValueError as exc:
+            elif model_name == MODEL_JOINT_MLP:
+                mlp_rows, mlp_summary = _mlp_rows(resolved, contexts, out_dir)
+                forecasts.extend(mlp_rows)
+                fit_info[MODEL_JOINT_MLP] = mlp_summary
+    except (ValueError, RuntimeError) as exc:
         print(f"run failed: {exc}", file=sys.stderr)
         return 2
 
@@ -568,6 +706,22 @@ def cmd_run(config_path: str, output: str) -> int:
     with open(out_dir / "checks.json", "w", encoding="utf-8") as handle:
         json.dump({"passed": checks_passed, "checks": checks}, handle, indent=2)
     pd.DataFrame(forecasts, columns=FORECAST_COLUMNS).to_csv(out_dir / "forecasts.csv", index=False)
+    # Failed rows keep their key and their reason in a separate, keyed artifact: the
+    # forecast table's schema stays unchanged, and a reader that only wants predictions is
+    # not handed a column it must ignore. Written even when empty, so its absence means
+    # "this run predates the artifact", not "nothing failed".
+    failures = pd.DataFrame(
+        [
+            {
+                **{column: row.get(column) for column in FAILURE_COLUMNS if column != "reason"},
+                "reason": str(row.get("_failure_reason", "") or ""),
+            }
+            for row in forecasts
+            if str(row.get("status", "ok")) != "ok"
+        ],
+        columns=FAILURE_COLUMNS,
+    )
+    failures.to_csv(out_dir / "failures.csv", index=False)
     oracle_path = out_dir / "oracle_curves.csv"
     if resolved["dataset_kind"] == "real":
         # No ground truth exists for market data. Write nothing rather than an empty
@@ -655,7 +809,14 @@ def _summary_md(resolved: dict, out_dir: Path, checks: list[dict], forecasts: li
     lines += [
         "- `checks.json` — offline verification results",
         "- `manifest.json` — provenance and versions",
+        "- `failures.csv` — explicit failed rows (keyed reason per origin and alpha); "
+        "empty when every requested row was forecast",
     ]
+    if MODEL_JOINT_MLP in resolved["models"]:
+        lines.append(
+            f"- `{MLP_CHECKPOINT_RELATIVE}/` — selected joint-MLP inference checkpoint "
+            "(parameters, normalization, training log); hashed in `manifest.json`"
+        )
     if real and data_info.get("exposure"):
         lines += ["", "## Declared exposure", "", str(data_info["exposure"])]
     return "\n".join(lines) + "\n"

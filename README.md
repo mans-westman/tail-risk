@@ -2,7 +2,7 @@
 
 Next-session value-at-risk (VaR) and expected shortfall (ES) forecasting for one daily return series, with synthetic cases where the true conditional risk is known. Returns are signed decimal log returns; `alpha` is a lower-tail probability, so forecasts satisfy `es <= var < 0` in normal cases.
 
-**Maturity: working research prototype.** Historical simulation and a fitted GARCH–Student-t baseline produce forecasts, and the CLI can independently verify, score, and report them. Both models run on synthetic data and an ingested real-data panel. The neural baseline is not implemented, and the available comparisons do not establish predictive superiority. Development status and dated evidence are kept in a local working log (`STATUS.md`), which is not distributed with the public package; this paragraph is the public-facing maturity statement and should stay short.
+**Maturity: working research prototype.** Historical simulation, a fitted GARCH–Student-t baseline and an alpha-conditioned joint MLP all produce forecasts, and the CLI can independently verify, score, and report them. All three models run on synthetic data and on an ingested real-data panel; the joint MLP has so far been run on the train/validation periods only (2016–2019 is development evidence, not a held-out result), its saved forecasts are replayed by `verify` from the checkpoint rather than refitted, and the available comparisons do not establish predictive superiority. Development status and dated evidence are kept in a local working log (`STATUS.md`), which is not distributed with the public package; this paragraph is the public-facing maturity statement and should stay short.
 
 ## Repository map
 
@@ -25,13 +25,16 @@ source .venv/bin/activate
 python -m pip install -e '.[dev]'
 ```
 
-`pyproject.toml` declares numpy, scipy and pandas as runtime dependencies and pytest plus `arch` as development dependencies. JAX/Optax are installed in the checked environment but are not yet required by working source; they will be declared when the neural baseline lands. Dependency ranges are not a locked environment. Each run records its interpreter and dependency versions in `manifest.json`.
+`pyproject.toml` declares numpy, scipy and pandas as runtime dependencies, pytest plus `arch` for development, and an optional `neural` extra for the alpha-conditioned MLP core. Install it with `python -m pip install -e '.[dev,neural]'` only if you are working on that core: the CLI and the conventional models never import JAX or Optax.
+
+The joint MLP is three layers: a mathematical core (`tailrisk.models.joint_mlp`: initialization, forward pass, FZ0 scores and their mean), a trainer (`tailrisk.models.joint_mlp_training`: train-only feature standardization, clipped-Adam fitting with validation-based checkpoint selection, original-unit prediction, NPZ+JSON inference checkpoint) and an adapter (`tailrisk.models.joint_mlp_model`) that builds the six causal features and per-origin return scale from one split's returns, reports unusable origins as explicit failed rows instead of dropping them, and turns the selected checkpoint into `forecast.csv` rows. The trainer consumes prepared arrays and decides no calendar cutoffs itself; the adapter receives only the origins the run's protocol permits. Installing the extra is required only when `models` includes `joint_mlp`. Dependency ranges are not a locked environment. Each run records its interpreter and dependency versions in `manifest.json`.
 
 ## Commands
 
 ```sh
 python -m pytest -q
 python -m tailrisk run      --config configs/smoke.json --output outputs/my-run
+python -m tailrisk run      --config configs/smoke_mlp.json --output outputs/my-mlp-run   # + joint MLP
 python -m tailrisk verify   --run outputs/my-run
 python -m tailrisk evaluate --run outputs/my-run
 python -m tailrisk report   --run outputs/my-run
@@ -70,10 +73,12 @@ A market-data run has no ground-truth oracle, so it writes no `oracle_curves.csv
 
 - `forecasts.csv` — one row per model, origin date, and alpha: `var`, `es`, `scale`, `realized_return`, `status`, in original return units.
 - `oracle_curves.csv` — evaluation-only synthetic truth (latent sigma and analytical oracle VaR/ES). Never a model input, and written only for synthetic runs: a real panel has no oracle at all.
+- `checkpoints/joint_mlp/` — written only when `joint_mlp` is configured: `checkpoint.json` (architecture, feature order, normalization, alpha grid, training log, selected epoch) and `arrays.npz` (parameters). `manifest.json` records the SHA-256 of both files plus the eligible row counts and selected epoch. `verify` loads this checkpoint, recomputes forecasts from the causal inputs and compares them with `forecasts.csv`; it never retrains, and a replaced or missing file fails verification. The smoke budget in `configs/smoke_mlp.json` is deliberately small: it is an execution check, not a trained result.
+- `failures.csv` — one row per failed forecast (`series_id, model_id, origin_date, target_date, alpha, scale, reason`), including runs with no failures (header only). Failed rows also stay in `forecasts.csv` with `status: "failed"` and no value, so the forecast schema is unchanged. `verify` requires the documented keys to match the failed rows one-to-one and recomputes each origin's six features to check that `ok` and `failed` are assigned exactly where the inputs allow, and that the stated reason is the one those features imply. Required only for `joint_mlp` runs. `verify` also derives the expected forecast keys per split, origin and alpha level from the permitted origins, the 63-return warm-up, the executed splits and the alpha grid, so a dropped origin, alpha level or whole split fails verification instead of shrinking the run silently.
 - `metrics.csv` — per split/model/alpha scores on a **common scoring mask**: within each (series, alpha) cell every model is scored on the same origins, so `n` is identical across models and means are comparable. `n_available`, `n_failed_rows` and `n_dropped_by_mask` expose the coverage cost; `n_invalid_output` counts non-finite predictions and violations of `es <= var < 0`, which are flagged rather than clipped. A model that fails outright empties its cell (all models report `n = 0`) instead of letting the survivors be scored alone, and a model listed in the resolved config that wrote no rows at all fails `evaluate` rather than shrinking the comparison. Scoring also rejects duplicate `(series, model, alpha, origin)` keys and target dates that do not follow their origins. Backtests are Kupiec (unconditional coverage) and Christoffersen (independence); `nan` means the statistic was undefined (for example no exceedances at all) and is reported as undefined rather than imputed. `n_transitions` and `n_chain_breaks` record how many chronologically adjacent pairs entered the independence test and how many were severed by a scoring-mask or session gap, so a broken chain is visible instead of silently joining non-adjacent days.
 - `checks.json` — offline mathematical checks; `manifest.json` / `config.resolved.json` — provenance; `summary.md`, `report.md` — readable outputs.
 
-Synthetic-only runs are execution checks, not statistical evidence. Oracle comparisons are implementation checks, not forecasting skill.
+Synthetic-only runs are execution checks, not statistical evidence. Oracle comparisons are implementation checks, not forecasting skill. A failed row (`status: "failed"`) carries a real origin and target, an explicit reason in `failures.csv` (checked by `verify` against the rebuilt features) and no forecast value: it is counted in `n_failed_rows` and never imputed, so coverage loss stays visible instead of shrinking the sample quietly.
 
 ## Reuse and limits
 

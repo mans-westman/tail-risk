@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .data import DataError, load_panel, validate_cutoffs
-from .features import FEATURE_WARMUP, build_feature_frame
+from .features import FEATURE_NAMES, FEATURE_WARMUP, build_feature_frame
 from .historical import historical_var_es
 from .simulation import generate_partitions
 
@@ -21,7 +21,8 @@ ORACLE_COLUMNS = ["series_id", "origin_date", "target_date", "alpha", "sigma", "
 
 MODEL_HISTORICAL = "historical_simulation"
 MODEL_GARCH_T = "garch_student_t"
-_KNOWN_MODELS = {MODEL_HISTORICAL, MODEL_GARCH_T}
+MODEL_JOINT_MLP = "joint_mlp"
+_KNOWN_MODELS = {MODEL_HISTORICAL, MODEL_GARCH_T, MODEL_JOINT_MLP}
 _VALID_STATUSES = {"ok", "failed", "missing"}
 
 # Artifacts every run writes. The oracle curve is separate because it exists only for
@@ -30,16 +31,34 @@ _VALID_STATUSES = {"ok", "failed", "missing"}
 CORE_ARTIFACTS = ("manifest.json", "config.resolved.json", "forecasts.csv")
 ORACLE_ARTIFACT = "oracle_curves.csv"
 
+# A joint-MLP run must also ship the selected inference checkpoint, because its forecasts
+# are not reproducible from configuration alone: they need the trained parameters and the
+# frozen train-only normalization.
+MLP_CHECKPOINT_DIR = "checkpoints/joint_mlp"
+MLP_CHECKPOINT_FILES = ("checkpoint.json", "arrays.npz")
+
+# Failed rows are documented in their own keyed artifact, so `forecasts.csv` keeps the
+# schema every existing reader expects.
+FAILURE_ARTIFACT = "failures.csv"
+FAILURE_COLUMNS = [
+    "run_id", "dataset_id", "series_id", "model_id",
+    "origin_date", "target_date", "alpha", "scale", "reason",
+]
+
 
 class ArtifactVerificationError(Exception):
     """Actionable error for missing or malformed run artifacts."""
 
 
-def required_artifacts(dataset_kind: str) -> tuple[str, ...]:
+def required_artifacts(dataset_kind: str, models: tuple[str, ...] | list[str] = ()) -> tuple[str, ...]:
     """Artifacts a run of this kind must contain."""
-    if dataset_kind == "real":
-        return CORE_ARTIFACTS
-    return CORE_ARTIFACTS + (ORACLE_ARTIFACT,)
+    artifacts = CORE_ARTIFACTS
+    if dataset_kind != "real":
+        artifacts = artifacts + (ORACLE_ARTIFACT,)
+    if MODEL_JOINT_MLP in set(models):
+        artifacts = artifacts + tuple(f"{MLP_CHECKPOINT_DIR}/{name}" for name in MLP_CHECKPOINT_FILES)
+        artifacts = artifacts + (FAILURE_ARTIFACT,)
+    return artifacts
 
 
 def _record(checks: list[dict], name: str, passed: bool, detail: str, applicable: bool = True) -> None:
@@ -81,6 +100,7 @@ class _Source:
     returns: np.ndarray
     origin_labels: tuple[str, ...]
     target_labels: tuple[str, ...]
+    allowed_origins: np.ndarray
 
     @property
     def index_of(self) -> dict[str, int]:
@@ -145,6 +165,7 @@ def _rebuild_sources(resolved: dict) -> tuple[dict[str, _Source], dict | None, s
                 returns=np.asarray(part.returns, dtype=float),
                 origin_labels=part.origin_dates,
                 target_labels=part.target_dates,
+                allowed_origins=np.asarray(part.scored_origin_indices, dtype=int),
             )
             for name, part in splits.items()
             if name in allowed_splits
@@ -169,6 +190,7 @@ def _rebuild_sources(resolved: dict) -> tuple[dict[str, _Source], dict | None, s
             returns=returns,
             origin_labels=tuple(str(index) for index in range(returns.size)),
             target_labels=tuple(str(index) for index in range(1, returns.size)),
+            allowed_origins=np.arange(max(returns.size - 1, 0), dtype=int),
         )
     return sources, partitions, ""
 
@@ -395,6 +417,352 @@ def _replay(
     _record(checks, name, ok, "; ".join(details) + env_note)
 
 
+def _expected_mlp_keys(
+    resolved: dict, sources: dict[str, "_Source"]
+) -> tuple[dict[tuple[str, str, float], str], list[float]]:
+    """Forecast keys a joint-MLP run must contain, derived from inputs alone.
+
+    Nothing here reads ``forecasts.csv``: permitted origins come from the series rebuilt out
+    of the panel or the declared DGP, the warm-up from the feature contract, the executed
+    splits from the resolved configuration and the alpha levels from the configured grid.
+    An origin whose features are unusable is still expected, because it must appear as an
+    explicit failure row rather than disappear.
+    """
+    alphas = [float(value) for value in resolved.get("alpha_grid", [])]
+    executed = list(resolved.get("splits", ("train", "validation", "test")))
+    expected: dict[tuple[str, str, float], str] = {}
+    for split in executed:
+        source = sources.get(split)
+        if source is None:
+            continue
+        permitted = {int(value) for value in source.allowed_origins}
+        for origin, label in enumerate(source.origin_labels):
+            if origin not in permitted or origin < FEATURE_WARMUP - 1 or origin >= source.returns.size - 1:
+                continue
+            for alpha in alphas:
+                expected[(source.series_id, str(label), round(alpha, 12))] = split
+    return expected, alphas
+
+
+def _mlp_forecast_keys_check(
+    checks: list[dict], resolved: dict, forecasts: pd.DataFrame, sources: dict[str, "_Source"]
+) -> None:
+    """Require exactly one saved row per expected (series, origin, alpha) key."""
+    expected, alphas = _expected_mlp_keys(resolved, sources)
+    rows = forecasts[forecasts["model_id"] == MODEL_JOINT_MLP] if not forecasts.empty else forecasts
+
+    saved: set[tuple[str, str, float]] = set()
+    duplicates = 0
+    for row in rows.itertuples(index=False):
+        key = (str(row.series_id), str(row.origin_date), round(float(row.alpha), 12))
+        if key in saved:
+            duplicates += 1
+        saved.add(key)
+
+    missing = sorted(set(expected) - set(saved))
+    unexpected = sorted(key for key in saved if key not in expected)
+    missing_by_split: dict[str, int] = {}
+    for key in missing:
+        missing_by_split[expected[key]] = missing_by_split.get(expected[key], 0) + 1
+    saved_by_split_counts: dict[str, int] = {}
+    for key in expected:
+        if key in saved:
+            saved_by_split_counts[expected[key]] = saved_by_split_counts.get(expected[key], 0) + 1
+    empty_splits = [split for split in resolved.get("splits", ()) if split in sources
+                    and saved_by_split_counts.get(split, 0) == 0]
+
+    passed = bool(expected) and not missing and not unexpected and not duplicates and not empty_splits
+    detail = (
+        f"expected={len(expected)} keys from {sorted(set(expected.values()))} x {len(alphas)} alphas; "
+        f"saved={len(saved)} rows; missing={len(missing)}"
+        + (f" {missing_by_split}" if missing_by_split else "")
+        + (f" e.g. {missing[:2]}" if missing else "")
+        + f"; unexpected={len(unexpected)}" + (f" e.g. {unexpected[:2]}" if unexpected else "")
+        + f"; duplicates={duplicates}"
+    )
+    if empty_splits:
+        detail += f"; split(s) with no joint_mlp row at all: {sorted(empty_splits)}"
+    _record(checks, "mlp_forecast_keys_complete", passed, detail)
+
+
+def _failure_reason_consistent(reason: str, has_feature_row: bool, unusable: list[str]) -> bool:
+    """Is a documented reason the one the rebuilt features imply?"""
+    if not reason:
+        return False
+    if not has_feature_row:
+        return reason == "feature_window_incomplete"
+    if unusable:
+        return reason == f"non_finite_features:{','.join(unusable)}"
+    # The origin's features exist and are finite, so the row failed for a non-feature
+    # reason (scale or target); any documented reason is accepted, but it must exist.
+    return True
+
+
+def _mlp_failure_checks(
+    checks: list[dict],
+    forecasts: pd.DataFrame,
+    failures: pd.DataFrame,
+    sources: dict[str, "_Source"],
+) -> None:
+    """Check that failed rows are documented once each, with the reason the inputs imply."""
+    failed = (
+        forecasts[(forecasts["model_id"] == MODEL_JOINT_MLP) & (forecasts["status"] != "ok")]
+        if not forecasts.empty
+        else forecasts
+    )
+    documented = failures[failures["model_id"] == MODEL_JOINT_MLP] if not failures.empty else failures
+
+    def _key(series_id, origin_date, alpha):
+        return (str(series_id), str(origin_date), round(float(alpha), 12))
+
+    failed_keys = {_key(row.series_id, row.origin_date, row.alpha) for row in failed.itertuples(index=False)}
+    documented_keys: set[tuple[str, str, float]] = set()
+    blank = 0
+    duplicates = 0
+    for row in documented.itertuples(index=False):
+        key = _key(row.series_id, row.origin_date, row.alpha)
+        if key in documented_keys:
+            duplicates += 1
+        documented_keys.add(key)
+        if not str(row.reason).strip():
+            blank += 1
+    undocumented = sorted(failed_keys - documented_keys)
+    orphaned = sorted(documented_keys - failed_keys)
+
+    passed = not undocumented and not orphaned and not blank and not duplicates
+    _record(
+        checks,
+        "failure_rows_documented",
+        passed,
+        f"failed rows={len(failed_keys)}; documented={len(documented_keys)}; "
+        f"undocumented={len(undocumented)}" + (f" e.g. {undocumented[:2]}" if undocumented else "")
+        + f"; documented but not failed={len(orphaned)}" + (f" e.g. {orphaned[:2]}" if orphaned else "")
+        + f"; blank reasons={blank}; duplicate keys={duplicates}",
+    )
+
+    # Independent eligibility: recompute the six features from the run's own returns and
+    # require every status to match. A failed row on a usable origin, or a forecast on an
+    # unusable one, is a mismatch rather than a rounding question.
+    reasons = {}
+    for row in documented.itertuples(index=False):
+        reasons[_key(row.series_id, row.origin_date, row.alpha)] = str(row.reason)
+
+    mismatches = 0
+    checked = 0
+    examples: list[str] = []
+    for source in sources.values():
+        page = forecasts[
+            (forecasts["model_id"] == MODEL_JOINT_MLP) & (forecasts["series_id"] == source.series_id)
+        ] if not forecasts.empty else forecasts
+        if page.empty:
+            continue
+        index_of = source.index_of
+        rows_by_origin = {int(row.origin_index): row for row in build_feature_frame(source.returns).itertuples()} \
+            if source.returns.size >= FEATURE_WARMUP + 1 else {}
+        for row in page.itertuples(index=False):
+            origin = index_of.get(str(row.origin_date))
+            if origin is None:
+                mismatches += 1
+                examples.append(f"{row.series_id}@{row.origin_date}: origin not in the rebuilt series")
+                continue
+            feature_row = rows_by_origin.get(origin)
+            unusable: list[str] = []
+            if feature_row is not None:
+                unusable = [name for name in FEATURE_NAMES
+                            if not np.isfinite(float(getattr(feature_row, name)))]
+            usable = feature_row is not None and not unusable
+            checked += 1
+            if str(row.status) == "ok":
+                if not usable:
+                    mismatches += 1
+                    examples.append(f"{row.series_id}@{row.origin_date}: forecast from unusable features")
+                continue
+            if usable:
+                mismatches += 1
+                examples.append(f"{row.series_id}@{row.origin_date}: failed although its features are usable")
+                continue
+            reason = reasons.get(_key(row.series_id, row.origin_date, row.alpha), "")
+            if not _failure_reason_consistent(reason, feature_row is not None, unusable):
+                mismatches += 1
+                examples.append(f"{row.series_id}@{row.origin_date}: reason {reason!r} vs features {unusable}")
+
+    _record(
+        checks,
+        "failed_rows_match_rebuilt_features",
+        mismatches == 0 and checked > 0,
+        f"checked={checked} rows; mismatches={mismatches}" + (f" e.g. {examples[:3]}" if examples else ""),
+    )
+
+
+def _mlp_checkpoint_checks(
+    checks: list[dict],
+    directory: Path,
+    resolved: dict,
+    manifest: dict,
+    forecasts: pd.DataFrame,
+    sources: dict[str, "_Source"],
+) -> None:
+    """Confirm saved joint-MLP forecasts follow from the checkpoint, not from a refit.
+
+    Replay loads the stored parameters and the frozen train-only normalization and recomputes
+    forecasts from the causal features rebuilt out of the run's own inputs. Any retraining
+    would land on different numbers, so agreement is evidence that the saved model -- not a
+    fresh fit -- produced the artifact. File hashes are compared first, because a replaced
+    checkpoint must be reported as a mismatch even if it happens to reproduce similar values.
+    """
+    import hashlib
+
+    checkpoint_dir = directory / MLP_CHECKPOINT_DIR
+    fit_info = (manifest.get("model_fit_info") or {}).get(MODEL_JOINT_MLP) or {}
+    record = fit_info.get("checkpoint") or {}
+    recorded = {
+        name: ((record.get("files") or {}).get(name) or {}).get("sha256")
+        for name in MLP_CHECKPOINT_FILES
+    }
+    missing = [name for name in MLP_CHECKPOINT_FILES if not (checkpoint_dir / name).is_file()]
+    actual = {
+        name: hashlib.sha256((checkpoint_dir / name).read_bytes()).hexdigest()
+        for name in MLP_CHECKPOINT_FILES
+        if name not in missing
+    }
+    unrecorded = [name for name in MLP_CHECKPOINT_FILES if not recorded[name]]
+    mismatched = [name for name in actual if recorded[name] and actual[name] != recorded[name]]
+    hash_ok = not missing and not unrecorded and not mismatched
+    _record(
+        checks,
+        "mlp_checkpoint_files_match_manifest",
+        hash_ok,
+        f"files={list(MLP_CHECKPOINT_FILES)}; missing={missing}; "
+        f"no recorded hash={unrecorded}; sha256 mismatched={mismatched}",
+    )
+
+    if missing:
+        _record(
+            checks,
+            "mlp_checkpoint_replay_from_causal_inputs",
+            False,
+            f"checkpoint file(s) missing: {missing}; the saved forecasts cannot be reproduced",
+        )
+        return
+
+    try:
+        from .models.joint_mlp_model import load_checkpointed_model, prepare_split
+        from .models.joint_mlp_training import predict_original_units
+
+        _, fitted = load_checkpointed_model(checkpoint_dir)
+    except Exception as exc:  # noqa: BLE001 - surface an actionable replay failure
+        _record(
+            checks,
+            "mlp_checkpoint_replay_from_causal_inputs",
+            False,
+            f"checkpoint unusable for replay: {exc}",
+        )
+        return
+
+    issues: list[str] = []
+    grid = [float(value) for value in resolved.get("alpha_grid", [])]
+    if [float(value) for value in fitted.alphas] != grid:
+        issues.append(f"checkpoint alphas {list(fitted.alphas)} != config {grid}")
+    recorded_features = tuple(fit_info.get("feature_names") or ())
+    if tuple(fitted.normalization.feature_names) != recorded_features:
+        issues.append(
+            f"checkpoint feature order {list(fitted.normalization.feature_names)} != manifest {list(recorded_features)}"
+        )
+    recorded_means = (fit_info.get("normalization") or {}).get("means")
+    if recorded_means is not None and not np.allclose(
+        np.asarray(recorded_means, dtype=float), fitted.normalization.means, rtol=0.0, atol=0.0
+    ):
+        issues.append("manifest normalization means differ from the checkpoint")
+    if not np.all(np.isfinite(fitted.normalization.scales)) or np.any(fitted.normalization.scales <= 0.0):
+        issues.append("checkpoint normalization scales are not finite and positive")
+    if not all(np.all(np.isfinite(np.asarray(value))) for value in fitted.params.values()):
+        issues.append("checkpoint parameters are not finite")
+    _record(
+        checks,
+        "mlp_checkpoint_metadata",
+        not issues,
+        "; ".join(issues) if issues else "feature order, alpha grid and normalization agree with the manifest",
+    )
+
+    subset = forecasts[forecasts["model_id"] == MODEL_JOINT_MLP] if not forecasts.empty else forecasts
+    if subset.empty:
+        _record(checks, "mlp_checkpoint_replay_from_causal_inputs", False, "no joint_mlp rows to replay")
+        return
+
+    rtol, atol = 1e-7, 1e-12
+    compared = 0
+    failed_rows = 0
+    mismatches = 0
+    try:
+        for source in sources.values():
+            rows = subset[subset["series_id"] == source.series_id]
+            if rows.empty:
+                continue
+            index_of = source.index_of
+            allowed = set(int(value) for value in source.allowed_origins)
+            labels = [str(label) for label in rows["origin_date"]]
+            unknown = [label for label in labels if label not in index_of or index_of[label] not in allowed]
+            mismatches += len(unknown)
+            requested = sorted({index_of[label] for label in labels if label in index_of and index_of[label] in allowed})
+            samples = prepare_split(
+                split=source.split,
+                series_id=source.series_id,
+                returns=source.returns,
+                origin_labels=source.origin_labels,
+                target_labels=source.target_labels,
+                allowed_origins=np.asarray(requested, dtype=int),
+            )
+            predicted: dict[tuple[int, float], tuple[float, float, float]] = {}
+            if samples.rows:
+                var, es = predict_original_units(
+                    fitted, samples.features, samples.scales, fitted.alphas
+                )
+                for position, origin in enumerate(samples.origin_indices):
+                    for column, alpha in enumerate(fitted.alphas):
+                        predicted[(int(origin), round(float(alpha), 12))] = (
+                            float(var[position, column]),
+                            float(es[position, column]),
+                            float(samples.scales[position]),
+                        )
+            for row in rows.itertuples(index=False):
+                origin = index_of.get(str(row.origin_date))
+                if origin is None or origin not in allowed:
+                    continue
+                if str(row.status) != "ok":
+                    # Status-versus-eligibility is checked independently in
+                    # `_mlp_failure_checks`; here a failed row only has to be visible.
+                    failed_rows += 1
+                    continue
+                expected = predicted.get((origin, round(float(row.alpha), 12)))
+                if expected is None:
+                    mismatches += 1
+                    continue
+                expected_var, expected_es, expected_scale = expected
+                compared += 1
+                if not (
+                    np.isclose(float(row.var), expected_var, rtol=rtol, atol=atol)
+                    and np.isclose(float(row.es), expected_es, rtol=rtol, atol=atol)
+                    and np.isclose(float(row.scale), expected_scale, rtol=rtol, atol=atol)
+                ):
+                    mismatches += 1
+    except Exception as exc:  # noqa: BLE001 - surface an actionable replay failure
+        _record(
+            checks,
+            "mlp_checkpoint_replay_from_causal_inputs",
+            False,
+            f"replay failed: {exc}",
+        )
+        return
+
+    _record(
+        checks,
+        "mlp_checkpoint_replay_from_causal_inputs",
+        mismatches == 0 and compared > 0,
+        f"compared={compared} mismatches={mismatches} failed_rows={failed_rows}; "
+        "recomputed from the saved checkpoint and causal features only (no retraining)",
+    )
+
+
 def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
     """Verify actual artifacts of a run directory.
 
@@ -412,11 +780,26 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
     dataset_kind = resolved.get("dataset_kind") or manifest.get("dataset_kind") or "synthetic"
     real = dataset_kind == "real"
 
-    for name in required_artifacts(dataset_kind):
+    alpha_grid = list(resolved.get("alpha_grid", []))
+    expected_models = set(resolved.get("models", [MODEL_HISTORICAL]))
+    unknown_models = expected_models - _KNOWN_MODELS
+    if unknown_models:
+        raise ArtifactVerificationError(
+            f"config.resolved.json declares unsupported models: {sorted(unknown_models)}; "
+            f"supported: {sorted(_KNOWN_MODELS)}"
+        )
+
+    for name in required_artifacts(dataset_kind, sorted(expected_models)):
         if not (directory / name).exists():
             raise ArtifactVerificationError(f"missing required artifact: {directory / name}")
 
     forecasts = _read_csv(directory / "forecasts.csv", "forecasts", FORECAST_COLUMNS)
+    failures_path = directory / FAILURE_ARTIFACT
+    failures = (
+        _read_csv(failures_path, "failures", FAILURE_COLUMNS)
+        if failures_path.exists()
+        else pd.DataFrame(columns=FAILURE_COLUMNS)
+    )
     oracle_path = directory / ORACLE_ARTIFACT
     oracle = (
         pd.DataFrame(columns=ORACLE_COLUMNS)
@@ -519,15 +902,6 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
             valid_cutoffs, detail = True, f"cutoffs={cutoffs}"
         _record(checks, "effective_cutoffs_frozen", valid_cutoffs, detail)
 
-    alpha_grid = list(resolved.get("alpha_grid", []))
-    expected_models = set(resolved.get("models", [MODEL_HISTORICAL]))
-    unknown_models = expected_models - _KNOWN_MODELS
-    if unknown_models:
-        raise ArtifactVerificationError(
-            f"config.resolved.json declares unsupported models: {sorted(unknown_models)}; "
-            f"supported: {sorted(_KNOWN_MODELS)}"
-        )
-
     # --- forecast table checks -------------------------------------------------
     if forecasts.empty:
         _record(checks, "forecasts_nonempty", False, "forecasts.csv contains zero rows")
@@ -556,14 +930,27 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
             f"found={sorted(alphas_present)} expected={sorted(expected_alphas)}",
         )
 
-        numeric_cols = ["alpha", "var", "es", "scale", "realized_return"]
-        finite_ok = True
-        for col in numeric_cols:
-            values = pd.to_numeric(forecasts[col], errors="coerce").to_numpy(dtype=float)
-            if not np.all(np.isfinite(values)):
-                finite_ok = False
+        # A realized target is known for every requested row, including a row whose model
+        # output failed. Forecast values are required to be finite on 'ok' rows only: a
+        # failed row carries NaN deliberately and is counted in n_failed_rows instead.
+        realized_finite = bool(
+            np.all(np.isfinite(pd.to_numeric(forecasts["realized_return"], errors="coerce")
+                               .to_numpy(dtype=float)))
+        )
+        ok_mask = forecasts["status"] == "ok"
+        ok_finite = True
+        for col in ("alpha", "var", "es", "scale"):
+            values = pd.to_numeric(forecasts.loc[ok_mask, col], errors="coerce").to_numpy(dtype=float)
+            if values.size and not np.all(np.isfinite(values)):
+                ok_finite = False
                 break
-        _record(checks, "forecast_values_finite", finite_ok, f"columns={numeric_cols}")
+        _record(
+            checks,
+            "forecast_values_finite",
+            realized_finite and ok_finite,
+            f"realized_return finite on all {len(forecasts)} rows; "
+            f"alpha/var/es/scale finite on {int(ok_mask.sum())} ok rows",
+        )
 
         statuses = set(forecasts["status"].astype(str).unique())
         _record(
@@ -574,7 +961,6 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
         )
 
         # Original-unit signed-return convention: es <= var < 0 for 'ok' rows.
-        ok_mask = forecasts["status"] == "ok"
         if ok_mask.any():
             var_vals = forecasts.loc[ok_mask, "var"].astype(float).to_numpy()
             es_vals = forecasts.loc[ok_mask, "es"].astype(float).to_numpy()
@@ -654,6 +1040,10 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
             real,
             _environment_drift(manifest),
         )
+        if MODEL_JOINT_MLP in expected_models:
+            _mlp_forecast_keys_check(checks, resolved, forecasts, sources)
+            _mlp_failure_checks(checks, forecasts, failures, sources)
+            _mlp_checkpoint_checks(checks, directory, resolved, manifest, forecasts, sources)
     elif sources:
         _record(checks, "replay_possible", False, "no forecast rows to replay")
 

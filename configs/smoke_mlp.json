@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "run_id": "mlp-smoke-20261103",
+  "dataset_id": "garch_student_t_mlp_smoke",
+  "dgp": {
+    "innovation": "student_t",
+    "omega": 5e-06,
+    "a": 0.05,
+    "b": 0.9,
+    "nu": 5,
+    "initial_variance": 0.0001,
+    "burn_in": 200
+  },
+  "partitions": {
+    "train": 320,
+    "validation": 160,
+    "test": 160
+  },
+  "seeds": {
+    "train": 11,
+    "validation": 22,
+    "test": 33
+  },
+  "splits": [
+    "train",
+    "validation"
+  ],
+  "alpha_grid": [
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.2
+  ],
+  "historical_window": 100,
+  "models": [
+    "historical_simulation",
+    "garch_student_t",
+    "joint_mlp"
+  ],
+  "mlp": {
+    "model_seed": 20261103,
+    "max_epochs": 4,
+    "batch_size": 64,
+    "patience": 2
+  },
+  "protocol": "Train and validation only. The test partition is declared but not simulated or evaluated, so no held-out observation can reach training, selection or scoring."
+}
