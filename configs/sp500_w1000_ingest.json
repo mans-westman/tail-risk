@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "dataset_id": "sp500_price_index",
+  "source": {
+    "kind": "yahoo_chart",
+    "instrument": "^GSPC",
+    "price_field": "close",
+    "adjustment": "none (price index)",
+    "timezone": "America/New_York",
+    "currency": "USD",
+    "requested_start": "1990-01-02",
+    "requested_end": "2025-12-31"
+  },
+  "units": "decimal_log",
+  "cutoffs": {
+    "train_end": "2015-12-31",
+    "validation_end": "2019-12-31"
+  },
+  "context_returns": 1101,
+  "required_context": 1000,
+  "historical_window": 1000,
+  "alpha_grid": [
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.2
+  ],
+  "models": [
+    "historical_simulation",
+    "garch_student_t"
+  ],
+  "exposure": "Descriptive data-audit exposure on 2026-11-02 (full-sample statistics and test-period extrema, including March 2020) by a planning agent; no predictive scoring or tuning on the sealed period is evidenced. Re-ingested on 2026-11-04 from the same dated raw snapshot with context_returns=1101 and required_context=1000 for the W=1000 development experiment; no new market data was downloaded."
+}
