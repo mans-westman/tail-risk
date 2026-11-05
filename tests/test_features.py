@@ -5,7 +5,12 @@ import pandas as pd
 import pytest
 
 from tailrisk.conventions import MIN_SCALE
-from tailrisk.features import FEATURE_NAMES, FEATURE_WARMUP, build_feature_frame
+from tailrisk.features import (
+    FEATURE_NAMES,
+    FEATURE_WARMUP,
+    build_feature_frame,
+    feature_at_origin,
+)
 
 
 def test_feature_names_and_warmup():
@@ -129,3 +134,69 @@ def test_feature_causality_future_perturbation_cannot_affect_earlier_features():
                 for feat in FEATURE_NAMES
             )
             assert features_differ
+
+
+def test_feature_at_origin_matches_the_frame_row():
+    """The target-free helper and the split-oriented frame share one numerical core."""
+    rng = np.random.default_rng(3)
+    returns = rng.normal(0.0002, 0.012, size=200)
+    frame = build_feature_frame(returns)
+    for origin in (FEATURE_WARMUP - 1, 120, 198):
+        row = frame[frame["origin_index"] == origin].iloc[0]
+        features = feature_at_origin(returns[: origin + 1])
+        # bitwise parity: same expressions on the same window, not an approximation
+        assert features.features == tuple(row[name] for name in FEATURE_NAMES)
+        assert features.return_scale == row["return_scale"]
+        assert features.scale_floor_active == bool(row["scale_floor_active"])
+        assert features.long_scale_floor_active == bool(row["long_scale_floor_active"])
+
+
+def test_feature_at_origin_reads_nothing_after_the_origin():
+    rng = np.random.default_rng(4)
+    returns = rng.normal(0.0, 0.01, size=200)
+    origin = 130
+    base = feature_at_origin(returns[: origin + 1])
+
+    shocked = returns.copy()
+    shocked[origin + 1 :] += 0.25  # an extreme future, invisible to a causal prefix
+    assert feature_at_origin(shocked[: origin + 1]) == base
+
+    # the helper reports the same numbers whether or not later observations exist at all
+    assert feature_at_origin(returns[: origin + 1]) == feature_at_origin(returns[: origin + 1].copy())
+
+
+@pytest.mark.parametrize("length", [0, 1, FEATURE_WARMUP - 1])
+def test_feature_at_origin_rejects_a_short_history(length):
+    with pytest.raises(ValueError, match="length >="):
+        feature_at_origin(np.zeros(length))
+
+
+def test_feature_at_origin_rejects_nonfinite_returns():
+    values = np.zeros(FEATURE_WARMUP)
+    values[-1] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        feature_at_origin(values)
+
+
+def test_feature_at_origin_reports_the_floor_and_a_degenerate_kurtosis():
+    # nearly constant series: the volatility floor binds and the kurtosis is undefined
+    constant = np.full(FEATURE_WARMUP, 1e-9)
+    features = feature_at_origin(constant)
+    assert features.scale_floor_active is True
+    assert features.return_scale == MIN_SCALE
+    assert np.isnan(features.features[FEATURE_NAMES.index("excess_kurtosis_63")])
+
+    # a single large return removes the floor at the next origin
+    shocked = np.concatenate([constant, [0.02]])
+    assert feature_at_origin(shocked).scale_floor_active is False
+
+
+def test_origin_features_vector_is_a_read_only_copy():
+    rng = np.random.default_rng(5)
+    features = feature_at_origin(rng.normal(0.0, 0.01, size=FEATURE_WARMUP))
+    vector = features.as_vector()
+    assert vector.shape == (len(FEATURE_NAMES),)
+    assert vector.flags.writeable is False
+    with pytest.raises(ValueError):
+        vector[0] = 1.0
+    assert features.as_dict() == dict(zip(FEATURE_NAMES, features.features))
