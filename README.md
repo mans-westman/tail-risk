@@ -1,14 +1,21 @@
-# Tailrisk
+# Tailrisk — conditional tail-risk research toolkit
 
-Next-session value-at-risk (VaR) and expected shortfall (ES) forecasting for one daily return series, with synthetic cases where the true conditional risk is known. Returns are signed decimal log returns; `alpha` is a lower-tail probability, so forecasts satisfy `es <= var < 0` in normal cases.
+A research toolkit for students and quantitative researchers comparing next-session value-at-risk (VaR) and expected shortfall (ES) models on one daily return series. It brings data timing, common-sample scoring, failure accounting and reproducibility evidence into one workflow. Synthetic cases supply known conditional risk; real data support forecast evaluation without an oracle. Returns are signed decimal log returns and `alpha` is a lower-tail probability; the supported scoring domain is `es <= var < 0`.
 
 **Maturity: working research prototype.** Historical simulation, a fitted GARCH–Student-t baseline and an alpha-conditioned joint MLP all produce forecasts, and the CLI can independently verify, score, and report them. All three models run on synthetic data and on an ingested real-data panel; the joint MLP has so far been run on the train/validation periods only (2016–2019 is development evidence, not a held-out result), its saved forecasts are replayed by `verify` from the checkpoint rather than refitted, and the available comparisons do not establish predictive superiority. Development status and dated evidence are kept in a local working log (`STATUS.md`), which is not distributed with the public package; this paragraph is the public-facing maturity statement and should stay short.
+
+## Approved delivery direction
+
+The next milestone adds a documented returns-CSV input, a small public Python model-adapter interface, and a comparison report that separates artifact integrity, verification coverage and statistical results. Humans and a regular WorkSwarm skill will use the same CLI. These additions are **planned, not yet implemented**; current commands below remain the working entry points.
+
+The [Stage 2 implementation roadmap](docs/STAGE2_IMPLEMENTATION.md) fixes the contracts and ordered acceptance gates. The toolkit does not certify absence of all leakage, regulatory suitability or universal model superiority. A novel constrained model is an optional later research extension, not a dependency of the reusable workflow.
 
 ## Repository map
 
 ```text
 tailrisk/                    # run commands here; Git root
   README.md                  # this file: purpose, setup, commands, artifact meaning
+  docs/                      # approved implementation roadmap; public usage docs added by slice
   configs/                   # JSON run and ingest configurations
   src/tailrisk/              # package and CLI
   tests/                     # numerical, timing, mask, and diagnostic checks
@@ -25,7 +32,7 @@ source .venv/bin/activate
 python -m pip install -e '.[dev]'
 ```
 
-`pyproject.toml` declares numpy, scipy and pandas as runtime dependencies, pytest plus `arch` for development, and an optional `neural` extra for the alpha-conditioned MLP core. Install it with `python -m pip install -e '.[dev,neural]'` only if you are working on that core: the CLI and the conventional models never import JAX or Optax.
+`pyproject.toml` declares numpy, scipy and pandas as runtime dependencies, pytest plus `arch` for development, and an optional `neural` extra for the alpha-conditioned MLP core. Install it with `python -m pip install -e '.[dev,neural]'` when running or developing the MLP: conventional-only CLI runs do not require JAX or Optax.
 
 The joint MLP is three layers: a mathematical core (`tailrisk.models.joint_mlp`: initialization, forward pass, FZ0 scores and their mean), a trainer (`tailrisk.models.joint_mlp_training`: train-only feature standardization, clipped-Adam fitting with validation-based checkpoint selection, original-unit prediction, NPZ+JSON inference checkpoint) and an adapter (`tailrisk.models.joint_mlp_model`) that builds the six causal features and per-origin return scale from one split's returns, reports unusable origins as explicit failed rows instead of dropping them, and turns the selected checkpoint into `forecast.csv` rows. The trainer consumes prepared arrays and decides no calendar cutoffs itself; the adapter receives only the origins the run's protocol permits. Installing the extra is required only when `models` includes `joint_mlp`. Dependency ranges are not a locked environment. Each run records its interpreter and dependency versions in `manifest.json`.
 
@@ -61,9 +68,9 @@ Development uses `configs/sp500_dev.json`, which executes train and validation o
 
 Panel runs require `train_end` and `validation_end` as `YYYY-MM-DD` strings, directly or through the ingestion audit. The resolved run configuration freezes both dates; verification uses those frozen dates and checks the consumed panel hash.
 
-A panel run is frozen rather than tuned: the split cutoffs, the 100-session window, the six alphas and the model set come from the config, and `run` refuses a panel that cannot supply every scored origin with a full trailing window. Every split carries its own causal context, so no opening session is discarded. Forecast rows carry real session dates instead of step indices, and only origins the panel marked `is_scored` are scored.
+A panel run is frozen rather than tuned: the split cutoffs, historical window, alphas and model set come from the config, and `run` refuses a panel that cannot supply every scored origin with a full trailing window. Every split carries its own causal context, so no opening session is discarded. Forecast rows carry real session dates instead of step indices, and only origins the panel marked `is_scored` are scored.
 
-The development historical window is 100 returns. At alpha <= 0.01, its empirical VaR and ES both equal the window minimum; these estimates cannot distinguish the quantile from the average of a more finely resolved tail. Window choice for the research comparison remains to be settled without using test-period performance.
+Legacy development configs use 100 returns; at alpha <= 0.01 their empirical VaR and ES both equal the window minimum. The subsequent frozen 2026-11-04 comparison adopted W=1000 before running, on tail-resolution and sample-availability grounds. Its configs are in `configs/experiment-20261104/`. New Stage 2 examples will specify W=1000 explicitly; old configs and results are preserved, not silently changed.
 
 The GARCH-t likelihood is fitted exactly once, on the train split, and frozen for every split a run executes — validation always, test only in an explicitly requested full-period run; the parameters are recorded in `manifest.json`. `verify` proves this independently by refitting from the panel's train slice alone and replaying every saved forecast, and it names any dependency drift between the verifying interpreter and the run's manifest, since a refit is only comparable across matching numeric builds.
 
