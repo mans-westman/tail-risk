@@ -44,6 +44,7 @@ from tailrisk.models.protocol import (
     invalid_output_reason,
     label_sort_keys,
     owning_read_only,
+    require_integer,
     validate_query_alphas,
 )
 from tailrisk.runner import (
@@ -200,7 +201,7 @@ def test_model_spec_accepts_the_three_builtin_shapes():
     [
         ({"contract_version": 2}, "not supported"),
         ({"minimum_history": 0}, "positive integer"),
-        ({"minimum_history": 63.5}, "positive integer"),
+        ({"minimum_history": 63.5}, "integer"),
         ({"alpha_min": 0.0}, "alpha domain"),
         ({"alpha_max": 0.6}, "alpha domain"),
         ({"alpha_min": 0.1, "alpha_max": 0.05}, "alpha domain"),
@@ -550,7 +551,7 @@ def test_fit_cutoff_accepts_a_target_on_the_boundary():
 
 def test_fit_cutoff_rejects_a_target_after_the_boundary():
     labels = _date_labels(120, start="2019-01-01")
-    with pytest.raises(ContractError, match="after the fitting cutoff"):
+    with pytest.raises(ContractError, match="after the cutoff"):
         build_fit_partition(
             series_id="fixture",
             path_id="train",
@@ -580,7 +581,7 @@ def test_fit_cutoff_compares_step_labels_numerically_not_lexicographically():
         cutoff_label="14",
     )
     assert accepted.target_indices[-1] == 14
-    with pytest.raises(ContractError, match="after the fitting cutoff"):
+    with pytest.raises(ContractError, match="after the cutoff"):
         build_fit_partition(
             series_id="fixture",
             path_id="train",
@@ -734,3 +735,181 @@ def test_contexts_built_from_a_simulated_path_convert_cleanly():
     assert partition.target_indices[0] == 63
     assert partition.target_indices[-1] == 199
     assert partition.rows == len(items)
+
+
+# --------------------------------------------------------------------------------------
+# repair 2026-11-05: the cutoff covers the whole exposed path, and indexes are exact
+# --------------------------------------------------------------------------------------
+
+
+def test_fit_cutoff_rejects_unselected_trailing_returns_with_date_labels():
+    """An otherwise valid partition whose *unselected* tail runs past the cutoff.
+
+    Every eligible target is inside the cutoff and every eligibility rule holds, yet the
+    adapter would still receive 19 returns dated after it. That is the leak this check
+    exists for: the tail of ``returns`` is readable even when no target lives there.
+    """
+    labels = _date_labels(120)
+    with pytest.raises(ContractError, match=r"19 of 120 return\(s\).*after the cutoff"):
+        build_fit_partition(
+            series_id="fixture",
+            path_id="train",
+            returns=_returns(120),
+            labels=labels,
+            allowed_origins=np.arange(99),  # targets 1..99, all <= labels[100]
+            minimum_history=1,
+            cutoff_label=labels[100],
+        )
+
+    # the same partition, bounded by the caller at the cutoff, is accepted unchanged
+    bounded = build_fit_partition(
+        series_id="fixture",
+        path_id="train",
+        returns=_returns(120)[:101],
+        labels=labels[:101],
+        allowed_origins=np.arange(99),
+        minimum_history=1,
+        cutoff_label=labels[100],
+    )
+    assert bounded.returns.size == 101
+    assert bounded.target_indices[-1] == 99
+    assert bounded.labels[-1] == labels[100]
+
+
+def test_fit_cutoff_rejects_unselected_trailing_returns_with_step_labels():
+    labels = _step_labels(120)
+    with pytest.raises(ContractError, match=r"19 of 120 return\(s\).*after the cutoff"):
+        build_fit_partition(
+            series_id="fixture",
+            path_id="train",
+            returns=_returns(120),
+            labels=labels,
+            allowed_origins=np.arange(99),
+            minimum_history=1,
+            cutoff_label="100",
+        )
+
+    bounded = build_fit_partition(
+        series_id="fixture",
+        path_id="train",
+        returns=_returns(120)[:101],
+        labels=labels[:101],
+        allowed_origins=np.arange(99),
+        minimum_history=1,
+        cutoff_label="100",
+    )
+    assert bounded.target_indices[-1] == 99
+
+
+def test_fit_cutoff_is_enforced_before_any_target_is_selected():
+    """A path one label past the cutoff fails even when it has no eligible target there."""
+    labels = _step_labels(12)
+    with pytest.raises(ContractError, match="after the cutoff"):
+        build_fit_partition(
+            series_id="fixture",
+            path_id="train",
+            returns=_returns(12),
+            labels=labels,
+            allowed_origins=np.array([1]),  # single eligible target, well inside
+            minimum_history=1,
+            cutoff_label="6",
+        )
+
+
+@pytest.mark.parametrize("value", [True, np.True_, 63.0, np.float64(63.0), "63", None])
+def test_origin_start_rejects_boolean_fractional_and_text_history(value):
+    with pytest.raises(ContractError, match="integer"):
+        origin_start_for(value)
+
+
+@pytest.mark.parametrize("value", [63, np.int32(63), np.int64(1001), np.uint16(70)])
+def test_origin_start_accepts_python_and_numpy_integers(value):
+    assert origin_start_for(value) == int(value) - 1
+
+
+def test_historical_minimum_history_rejects_booleans_but_accepts_numpy_integers():
+    with pytest.raises(ContractError, match="integer"):
+        historical_minimum_history(True)
+    assert historical_minimum_history(np.int64(20)) == 63
+    assert historical_minimum_history(np.int64(1000)) == 1001
+
+
+@pytest.mark.parametrize(
+    "positions",
+    [
+        [True, False],
+        np.array([True, False]),
+        np.array([1.0, 2.0]),
+        np.array([1.5, 2.5]),
+    ],
+)
+def test_permitted_origins_reject_boolean_and_floating_positions(positions):
+    with pytest.raises(ContractError, match="integer array"):
+        permitted_origins(positions, size=200, minimum_history=63)
+
+
+@pytest.mark.parametrize("dtype", [np.int8, np.int32, np.int64, np.uint16])
+def test_permitted_origins_accept_numpy_integer_dtypes(dtype):
+    positions = permitted_origins(
+        np.array([62, 70], dtype=dtype), size=200, minimum_history=63
+    )
+    assert positions.tolist() == [62, 70]
+    assert positions.dtype == np.dtype(int)
+
+
+@pytest.mark.parametrize("value", [3.5, True, np.float64(3.0), "3", None])
+def test_build_prediction_input_rejects_a_non_integer_origin(value):
+    context = _context()
+    with pytest.raises(ContractError, match="integer"):
+        build_prediction_input(
+            series_id=context.series_id,
+            path_id="train",
+            origin_index=value,
+            origin_label=context.origin_labels[0],
+            returns=context.returns,
+            labels=context.origin_labels,
+        )
+
+
+@pytest.mark.parametrize("origin", [-1, 200])
+def test_build_prediction_input_rejects_an_origin_with_no_history(origin):
+    context = _context()
+    with pytest.raises(ContractError, match="outside"):
+        build_prediction_input(
+            series_id=context.series_id,
+            path_id="train",
+            origin_index=origin,
+            origin_label=context.origin_labels[0],
+            returns=context.returns,
+            labels=context.origin_labels,
+        )
+
+
+def test_prediction_input_rejects_an_empty_history():
+    with pytest.raises(ContractError, match="length >= 1"):
+        PredictionInput(
+            series_id="s",
+            path_id="p",
+            origin_label="0",
+            history=owning_read_only([], name="history"),
+            history_labels=(),
+        )
+
+
+def test_prediction_inputs_are_empty_for_an_empty_permitted_set():
+    context = _context(allowed=np.array([], dtype=int))
+    assert prediction_inputs(context, path_id="train", minimum_history=63) == ()
+
+
+@pytest.mark.parametrize("target", [0, 200, -3])
+def test_fit_partition_history_for_rejects_a_position_without_history(target):
+    with pytest.raises(ContractError):
+        _partition().history_for(target)
+
+
+def test_require_integer_accepts_only_exact_integers():
+    assert require_integer(7) == 7
+    assert require_integer(np.int64(7)) == 7
+    for bad in (True, np.False_, 7.0, np.float64(7.0), "7", None):
+        with pytest.raises(ContractError, match="integer"):
+            require_integer(bad)

@@ -15,9 +15,17 @@ import pandas as pd
 
 from .features import FEATURE_WARMUP, build_feature_frame
 from .historical import historical_var_es
+from .models.protocol import CONTRACT_VERSION, invalid_output_reason
+from .models.registry import factory_provenance, resolve_custom_models
+from .runner import run_model, run_model_instance
 from .simulation import generate_partitions
 from .verification import all_checks_pass, run_offline_checks
-from .verification_artifacts import ArtifactVerificationError, verify_run_artifacts
+from .verification_artifacts import (
+    COVERAGE_ARTIFACT,
+    ArtifactVerificationError,
+    verification_coverage,
+    verify_run_artifacts,
+)
 
 FORECAST_COLUMNS = [
     "run_id",
@@ -86,9 +94,20 @@ def _resolve_common(resolved: dict) -> dict:
     models = list(resolved.get("models", [MODEL_HISTORICAL]))
     if not models:
         raise ValueError("models must be a nonempty list")
-    unknown = [name for name in models if name not in SUPPORTED_MODELS]
+    # A custom id is legitimate exactly when the configuration also declares its factory,
+    # so the supported set is the built-ins plus this run's declarations -- not a list the
+    # CLI has to be edited for.
+    declared_custom = resolved.get("custom_models") or {}
+    if not isinstance(declared_custom, dict):
+        raise ValueError("'custom_models' must be a JSON object mapping model id to configuration")
+    unknown = [
+        name for name in models if name not in SUPPORTED_MODELS and name not in declared_custom
+    ]
     if unknown:
-        raise ValueError(f"unsupported models: {unknown}; supported: {list(SUPPORTED_MODELS)}")
+        raise ValueError(
+            f"unsupported models: {unknown}; supported: {list(SUPPORTED_MODELS)}, plus any "
+            "model id declared under 'custom_models'"
+        )
     resolved["models"] = models
 
     declared_splits = resolved.get("splits")
@@ -655,6 +674,83 @@ def _data_checks(resolved: dict, contexts: list[SeriesContext], forecasts: list[
     return checks
 
 
+def _model_settings(resolved: dict, model_name: str) -> dict:
+    """The constructor settings a built-in adapter factory takes for one model.
+
+    Settings are passed explicitly rather than as the whole resolved config, so an adapter
+    cannot read a key it never declared (the factory rejects unknown ones).
+    """
+    if model_name == MODEL_HISTORICAL:
+        return {"window": resolved["historical_window"]}
+    if model_name == MODEL_GARCH_T:
+        return {}
+    if model_name == MODEL_JOINT_MLP:
+        return {key: resolved["mlp"][key] for key in MLP_BUDGET_KEYS if key in resolved["mlp"]}
+    raise ValueError(f"unsupported model {model_name!r}; expected one of {list(SUPPORTED_MODELS)}")
+
+
+def _model_seed(resolved: dict, model_name: str) -> int | None:
+    """The model seed for models that draw one; ``None`` for the deterministic ones."""
+    if model_name == MODEL_JOINT_MLP:
+        return int(resolved["mlp"]["model_seed"])
+    return None
+
+
+def _declared_cutoffs(resolved: dict) -> dict[str, str]:
+    """Fitting cutoffs declared by the run, per split, when it has any.
+
+    A real panel declares ``train_end`` and ``validation_end``; those are handed to the
+    runner so a fitting path that runs past its split raises instead of being trimmed. A
+    synthetic run declares none, and the runner then uses each partition's own structural
+    boundary.
+    """
+    declared = resolved.get("cutoffs") or {}
+    mapping = {}
+    if declared.get("train_end"):
+        mapping["train"] = str(declared["train_end"])
+    if declared.get("validation_end"):
+        mapping["validation"] = str(declared["validation_end"])
+    return mapping
+
+
+def _reason_for_row(row: dict) -> str | None:
+    """The single keyed reason a forecast row deserves, or ``None`` when it needs none.
+
+    An explicit failure carries the adapter's reason; a successful output that is
+    nonetheless unusable (non-finite, or outside the supported domain) carries the
+    runner's vocabulary reason. One reason per affected key, so a reader joining the
+    reason table on the forecast key cannot double-count a row. A blank adapter reason is
+    returned as a blank string rather than dropped, so it stays visible as a defect.
+    """
+    if str(row.get("status", "ok")) != "ok":
+        return str(row.get("_failure_reason", "") or "")
+    invalid = row.get("_invalid_reason")
+    return None if invalid is None else str(invalid)
+
+
+def _checkpoint_record(entry: dict, out_dir: Path) -> dict | None:
+    """Content of one model's promised checkpoint, relative to the run directory.
+
+    Hashes are computed from the bytes on disk, not from the model's own metadata: a
+    recorded self-report would make the later tamper check circular, since the same code
+    would be asserting both the claim and its evidence. A promised file that was never
+    written is recorded as such rather than omitted.
+    """
+    relative = entry.get("path")
+    if not relative:
+        return None
+    root = out_dir / str(relative)
+    files: dict[str, dict] = {}
+    for name in sorted(entry.get("files") or ()):
+        path = root / name
+        if not path.is_file():
+            files[name] = {"sha256": None, "bytes": None, "note": "promised file not written"}
+            continue
+        payload = path.read_bytes()
+        files[name] = {"sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload)}
+    return {"path": str(relative), "files": files}
+
+
 def cmd_run(config_path: str, output: str) -> int:
     start = time.perf_counter()
     out_dir = Path(output)
@@ -665,6 +761,14 @@ def cmd_run(config_path: str, output: str) -> int:
     try:
         config = _load_config(Path(config_path))
         resolved = _resolve_config(config)
+        # Custom factories are resolved and constructed before any data is read: a
+        # malformed reference, an unimportable module or an adapter whose declared spec
+        # disagrees with the configured id stops the run here rather than after a
+        # comparison has already been computed for the other models.
+        custom = resolve_custom_models(
+            resolved.get("custom_models"), selected=resolved["models"]
+        )
+        custom_instances = {name: factory.build() for name, factory in custom.items()}
     except (ValueError, OSError, json.JSONDecodeError) as exc:
         print(f"run failed: {exc}", file=sys.stderr)
         return 2
@@ -680,18 +784,35 @@ def cmd_run(config_path: str, output: str) -> int:
     contexts = _series_contexts(resolved, series_map)
     forecasts: list[dict] = []
     fit_info: dict[str, dict] = {}
+    coverage: dict[str, dict] = {}
     try:
         for model_name in resolved["models"]:
-            if model_name == MODEL_HISTORICAL:
-                forecasts.extend(_historical_rows(resolved, contexts))
-            elif model_name == MODEL_GARCH_T:
-                garch_rows, garch_summary = _garch_rows(resolved, contexts)
-                forecasts.extend(garch_rows)
-                fit_info[MODEL_GARCH_T] = garch_summary
-            elif model_name == MODEL_JOINT_MLP:
-                mlp_rows, mlp_summary = _mlp_rows(resolved, contexts, out_dir)
-                forecasts.extend(mlp_rows)
-                fit_info[MODEL_JOINT_MLP] = mlp_summary
+            if model_name in custom_instances:
+                run = run_model_instance(
+                    custom_instances[model_name],
+                    contexts=contexts,
+                    alphas=resolved["alpha_grid"],
+                    run_id=resolved.get("run_id", "run"),
+                    dataset_id=resolved.get("dataset_id", "synthetic"),
+                    cutoffs=_declared_cutoffs(resolved),
+                    checkpoint_dir=out_dir,
+                )
+            else:
+                run = run_model(
+                    model_name,
+                    contexts=contexts,
+                    alphas=resolved["alpha_grid"],
+                    settings=_model_settings(resolved, model_name),
+                    seed=_model_seed(resolved, model_name),
+                    run_id=resolved.get("run_id", "run"),
+                    dataset_id=resolved.get("dataset_id", "synthetic"),
+                    cutoffs=_declared_cutoffs(resolved),
+                    checkpoint_dir=out_dir,
+                )
+            forecasts.extend(run.rows)
+            if run.summary:
+                fit_info[model_name] = run.summary
+            coverage[model_name] = run.coverage
     except (ValueError, RuntimeError) as exc:
         print(f"run failed: {exc}", file=sys.stderr)
         return 2
@@ -710,14 +831,19 @@ def cmd_run(config_path: str, output: str) -> int:
     # forecast table's schema stays unchanged, and a reader that only wants predictions is
     # not handed a column it must ignore. Written even when empty, so its absence means
     # "this run predates the artifact", not "nothing failed".
+    #
+    # Contract v1 widens the table to the union of explicit failures and *invalid outputs*:
+    # a row whose numbers are finite-shaped but unusable (non-finite, or outside the
+    # supported domain) keeps its status and its numbers, because the evaluator has to see
+    # them, and gains exactly one reason row here.
     failures = pd.DataFrame(
         [
             {
                 **{column: row.get(column) for column in FAILURE_COLUMNS if column != "reason"},
-                "reason": str(row.get("_failure_reason", "") or ""),
+                "reason": _reason_for_row(row),
             }
             for row in forecasts
-            if str(row.get("status", "ok")) != "ok"
+            if _reason_for_row(row) is not None
         ],
         columns=FAILURE_COLUMNS,
     )
@@ -733,8 +859,31 @@ def cmd_run(config_path: str, output: str) -> int:
 
     manifest = _manifest(config, resolved, start, "complete" if checks_passed else "partial")
     manifest["data"] = data_info
+    # Additive marker: every run written from here on uses adapter contract v1. Verifiers
+    # dispatch on its presence, so runs created before it keep their legacy artifact
+    # requirements instead of acquiring new missing-artifact failures.
+    manifest["adapter_contract_version"] = CONTRACT_VERSION
+    if custom:
+        manifest["custom_factories"] = {
+            name: factory_provenance(factory) for name, factory in custom.items()
+        }
+    checkpoints = {
+        name: _checkpoint_record(entry["checkpoint"], out_dir)
+        for name, entry in coverage.items()
+        if entry.get("checkpoint")
+    }
+    if checkpoints:
+        # What each checkpointed model promised to leave on disk, hashed from the bytes
+        # that are actually there. Verification compares against this record, so a
+        # replaced or deleted checkpoint is a mismatch rather than an untested claim.
+        manifest["checkpoints"] = checkpoints
     if fit_info:
         manifest["model_fit_info"] = fit_info
+    if coverage:
+        # What each model actually covered: origins per split, how many were answered,
+        # how many failed, and whether any answer was outside the supported domain. Additive
+        # to schema_version 1; the artifact checks read only what they already read.
+        manifest["model_coverage"] = coverage
     with open(out_dir / "manifest.json", "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
 
@@ -835,13 +984,23 @@ def cmd_verify(run_dir: str) -> int:
     result_path = directory / "artifact_verification.json"
     with open(result_path, "w", encoding="utf-8") as handle:
         json.dump({"passed": passed, "checks": checks}, handle, indent=2)
+    coverage = verification_coverage(checks)
+    coverage_path = directory / COVERAGE_ARTIFACT
+    with open(coverage_path, "w", encoding="utf-8") as handle:
+        json.dump(coverage, handle, indent=2)
     applicable = [check for check in checks if check.get("applicable", True)]
     print(
         f"verified run artifacts {directory}: "
         f"{sum(c['passed'] for c in applicable)}/{len(applicable)} applicable checks passed; "
         f"{len(checks) - len(applicable)} not applicable; "
+        f"{coverage['counts']['unavailable']} unavailable; "
         f"results -> {result_path}"
     )
+    if coverage["partial"]:
+        print(
+            "  coverage is PARTIAL: an optional check could not be performed on this run "
+            f"(see {coverage_path}); an unavailable capability is not a pass"
+        )
     for check in checks:
         if check.get("applicable", True):
             label = "PASS" if check["passed"] else "FAIL"
@@ -969,6 +1128,7 @@ def cmd_ingest(
     try:
         panel, audit = ingest(
             config,
+            base_dir=Path(config_path).parent,
             from_raw=from_raw,
             raw_cache=keep_raw,
             reference_returns=reference_returns,
@@ -980,11 +1140,22 @@ def cmd_ingest(
     paths = write_dataset(panel, audit, out_dir)
     scored = panel.loc[panel["is_scored"]]
     print(f"ingest complete -> {paths['panel']}")
-    print(
-        f"  prices: {audit['coverage']['prices']} "
-        f"({audit['coverage']['first_session']} -> {audit['coverage']['last_session']})"
-    )
-    print(f"  returns: {audit['coverage']['returns']} decimal log returns")
+    coverage = audit["coverage"]
+    if "prices" in coverage:
+        print(
+            f"  prices: {coverage['prices']} "
+            f"({coverage['first_session']} -> {coverage['last_session']})"
+        )
+    else:
+        print(
+            f"  source: local returns file {audit['source']['path']} "
+            f"(declared {audit['units']['returns']}); no price column, no provider"
+        )
+        print(
+            f"  sessions: {coverage['first_return_target']} -> "
+            f"{coverage['last_return_target']}"
+        )
+    print(f"  returns: {coverage['returns']} decimal log returns")
     for split, info in audit["splits"]["splits"].items():
         print(
             f"  {split}: {info['targets']} targets "

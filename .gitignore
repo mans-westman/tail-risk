@@ -16,6 +16,9 @@ htmlcov/
 /outputs/*
 !/outputs/README.md
 /data/
+# The worked example ships its generator, not its bytes: the CSV is regenerated
+# deterministically by examples/custom_model/make_demo_returns.py.
+/examples/custom_model/data/
 *.log
 
 # Credentials and local editor/OS state

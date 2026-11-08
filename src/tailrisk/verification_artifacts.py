@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import importlib
 import json
+import sys
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version as _distribution_version
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -11,6 +15,16 @@ import pandas as pd
 from .data import DataError, load_panel, validate_cutoffs
 from .features import FEATURE_NAMES, FEATURE_WARMUP, build_feature_frame
 from .historical import historical_var_es
+from .models.protocol import (
+    CONTRACT_VERSION,
+    GARCH_MINIMUM_HISTORY,
+    MLP_MINIMUM_HISTORY,
+    Forecast,
+    check_forecast_sequence,
+    historical_minimum_history,
+    invalid_output_reason,
+)
+from .runner import iter_prediction_inputs
 from .simulation import generate_partitions
 
 FORECAST_COLUMNS = [
@@ -45,24 +59,92 @@ FAILURE_COLUMNS = [
     "origin_date", "target_date", "alpha", "scale", "reason",
 ]
 
+#: Additive manifest marker that distinguishes adapter-contract runs from legacy ones.
+CONTRACT_MARKER = "adapter_contract_version"
+
+#: Coverage artifact written by `verify`, derived from the checks it just ran.
+COVERAGE_ARTIFACT = "verification_coverage.json"
+
 
 class ArtifactVerificationError(Exception):
     """Actionable error for missing or malformed run artifacts."""
 
 
-def required_artifacts(dataset_kind: str, models: tuple[str, ...] | list[str] = ()) -> tuple[str, ...]:
-    """Artifacts a run of this kind must contain."""
+def required_artifacts(
+    dataset_kind: str,
+    models: tuple[str, ...] | list[str] = (),
+    *,
+    adapter_contract_version: int | None = None,
+) -> tuple[str, ...]:
+    """Artifacts a run of this kind must contain.
+
+    A contract-v1 run documents per-key reasons for *every* model, so its reason table is
+    a required artifact. Legacy runs keep their previous requirements -- the MLP's table
+    was already mandatory, a historical/GARCH-only run was not required to have one -- so
+    a historical run created before the marker does not acquire a new missing-artifact
+    failure.
+    """
     artifacts = CORE_ARTIFACTS
     if dataset_kind != "real":
         artifacts = artifacts + (ORACLE_ARTIFACT,)
     if MODEL_JOINT_MLP in set(models):
         artifacts = artifacts + tuple(f"{MLP_CHECKPOINT_DIR}/{name}" for name in MLP_CHECKPOINT_FILES)
+    if adapter_contract_version == CONTRACT_VERSION or MODEL_JOINT_MLP in set(models):
         artifacts = artifacts + (FAILURE_ARTIFACT,)
     return artifacts
 
 
-def _record(checks: list[dict], name: str, passed: bool, detail: str, applicable: bool = True) -> None:
-    checks.append({"name": name, "passed": bool(passed), "detail": detail, "applicable": bool(applicable)})
+def _record(
+    checks: list[dict],
+    name: str,
+    passed: bool,
+    detail: str,
+    applicable: bool = True,
+    unavailable: bool = False,
+) -> None:
+    """Append one check result.
+
+    ``applicable=False`` means the check does not apply to this run (no oracle for market
+    data). ``unavailable=True`` means the check *would* apply but the capability needed to
+    perform it is missing -- an unsupported replay, for instance. The two are reported
+    differently on purpose: an unavailable capability is a gap in coverage, not a statement
+    that nothing was required.
+    """
+    checks.append(
+        {
+            "name": name,
+            "passed": bool(passed),
+            "detail": detail,
+            "applicable": bool(applicable),
+            "unavailable": bool(unavailable),
+        }
+    )
+
+
+def verification_coverage(checks: list[dict]) -> dict:
+    """Classify already-computed checks as an evidence record.
+
+    Deliberately a pure projection of ``checks``: a coverage report computed by a second,
+    independent process is a second opinion, not a description of what was verified.
+    """
+    records = []
+    counts = {"passed": 0, "failed": 0, "unavailable": 0, "not_applicable": 0}
+    for check in checks:
+        if check.get("unavailable"):
+            status = "unavailable"
+        elif not check.get("applicable", True):
+            status = "not_applicable"
+        else:
+            status = "passed" if check["passed"] else "failed"
+        counts[status] += 1
+        records.append({"name": check["name"], "status": status, "reason": check["detail"]})
+    return {
+        "schema_version": 1,
+        "adapter_contract_version": CONTRACT_VERSION,
+        "counts": counts,
+        "partial": bool(counts["unavailable"]),
+        "checks": records,
+    }
 
 
 def _read_json(path: Path, label: str) -> dict:
@@ -763,6 +845,683 @@ def _mlp_checkpoint_checks(
     )
 
 
+def _series_key(row: Any) -> tuple[str, str, float]:
+    """Within one model's rows: (series, origin, alpha)."""
+    return (str(row.series_id), str(row.origin_date), round(float(row.alpha), 12))
+
+
+def _affected_key(row: Any) -> tuple[str, str, str, float]:
+    """The key a forecast row shares with its reason row: model, series, origin, alpha.
+
+    ``model_id`` is part of the key because ``failures.csv`` is a single table for the whole
+    run. Without it, two models documenting a failure at the same origin and level collide:
+    the second is counted as a duplicate of the first, and dropping one of the two reasons
+    then makes the collision disappear. The key has to name the row the reason belongs to.
+    """
+    return (
+        str(row.model_id),
+        str(row.series_id),
+        str(row.origin_date),
+        round(float(row.alpha), 12),
+    )
+
+
+def _reason_text(value: Any) -> str:
+    """A reason column value as stripped text; absent or NaN becomes an empty string."""
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return ""
+    return str(value).strip()
+
+
+def _row_invalid_reason(row: Any) -> str | None:
+    """The runner's own verdict on a saved row's numbers, recomputed from the row.
+
+    Delegates to :func:`tailrisk.models.protocol.invalid_output_reason` rather than
+    restating "es <= var < 0 and finite" here: two copies of a numerical predicate drift,
+    and the one that drifts is always the one a reader trusts.
+    """
+    if str(row.status) != "ok":
+        return None
+    scale = row.scale
+    forecast = Forecast(
+        alpha=float(row.alpha),
+        var=float(row.var),
+        es=float(row.es),
+        scale=None if pd.isna(scale) else float(scale),
+        status="ok",
+    )
+    return invalid_output_reason(forecast)
+
+
+def _expected_keys_for_model(
+    minimum_history: int, resolved: dict, sources: dict[str, "_Source"]
+) -> dict[tuple[str, str, float], str]:
+    """Forecast keys one model must produce, derived from inputs and its own warm-up.
+
+    Nothing here reads ``forecasts.csv``: the executed splits come from the resolved
+    configuration, the permitted origins from the series rebuilt out of the panel or the
+    declared DGP, the warm-up from the adapter's *declared* minimum history, and the alpha
+    levels from the configured grid. An origin inside the warm-up is excluded; a permitted
+    origin a model could not answer must still appear, as a failure row.
+
+    This is the same rule the runner applies (``permitted_origins``): an origin is
+    permitted when it is in the caller's allowed set, at or after ``minimum_history - 1``,
+    and has a target in the path.
+    """
+    alphas = [float(value) for value in resolved.get("alpha_grid", [])]
+    start = max(int(minimum_history) - 1, 0)
+    expected: dict[tuple[str, str, float], str] = {}
+    for split in resolved.get("splits", ("train", "validation", "test")):
+        source = sources.get(split)
+        if source is None:
+            continue
+        permitted = {int(value) for value in source.allowed_origins}
+        for origin, label in enumerate(source.origin_labels):
+            if origin not in permitted or origin < start or origin >= source.returns.size - 1:
+                continue
+            for alpha in alphas:
+                expected[(source.series_id, str(label), round(alpha, 12))] = split
+    return expected
+
+
+def _generic_completeness_checks(
+    checks: list[dict],
+    resolved: dict,
+    manifest: dict,
+    forecasts: pd.DataFrame,
+    sources: dict[str, "_Source"],
+    expected_models: set[str],
+) -> None:
+    """Every executed model answered every key its own warm-up permits."""
+    coverage = manifest.get("model_coverage") or {}
+    absent = sorted(model for model in expected_models if model not in coverage)
+    _record(
+        checks,
+        "model_coverage_declared",
+        not absent,
+        f"models with a coverage block={sorted(set(coverage) & expected_models)}; "
+        f"declared but uncovered={absent}"
+        + ("" if not absent else
+           "; an adapter's minimum history is not recoverable, so its expected keys cannot be derived"),
+    )
+
+    for model_id in sorted(expected_models):
+        entry = coverage.get(model_id) or {}
+        minimum_history = entry.get("minimum_history")
+        if not isinstance(minimum_history, int) or isinstance(minimum_history, bool):
+            _record(
+                checks,
+                f"forecast_keys_complete:{model_id}",
+                False,
+                f"no integer minimum_history recorded for {model_id!r}; expected keys cannot be "
+                "derived without the adapter's declared warm-up",
+            )
+            continue
+        expected = _expected_keys_for_model(minimum_history, resolved, sources)
+        subset = (
+            forecasts[forecasts["model_id"] == model_id] if not forecasts.empty else forecasts
+        )
+        saved: set[tuple[str, str, float]] = set()
+        duplicates = 0
+        for row in subset.itertuples(index=False):
+            key = _series_key(row)
+            if key in saved:
+                duplicates += 1
+            saved.add(key)
+        missing = sorted(set(expected) - saved)
+        unexpected = sorted(key for key in saved if key not in expected)
+        passed = bool(expected) and not missing and not unexpected and not duplicates
+        _record(
+            checks,
+            f"forecast_keys_complete:{model_id}",
+            passed,
+            f"minimum_history={minimum_history}; expected={len(expected)} keys; "
+            f"saved={len(saved)}; missing={len(missing)}"
+            + (f" e.g. {missing[:2]}" if missing else "")
+            + f"; unexpected={len(unexpected)}"
+            + (f" e.g. {unexpected[:2]}" if unexpected else "")
+            + f"; duplicate keys={duplicates}",
+        )
+
+
+def _failure_union_checks(
+    checks: list[dict], forecasts: pd.DataFrame, failures: pd.DataFrame
+) -> None:
+    """The reason table names every affected key exactly once, with the right kind of text.
+
+    A key is *affected* when the model failed explicitly, or when it returned numbers the
+    supported domain cannot score. Both kinds must be present exactly once and be keyed by
+    model as well as series, origin and level.
+
+    The two kinds are held to different standards on purpose. An invalid output is a defect
+    the runner named itself, so the documented reason must be *exactly* the reason recomputed
+    from the row: a free-form sentence there is not an explanation, it is a reason that
+    disagrees with the evidence. An explicit failure is the adapter's own declaration, so its
+    text is recorded but not independently established — it must merely be nonempty, and a
+    missing or NaN entry is treated as empty rather than read as the string ``"nan"``.
+    """
+    affected: set[tuple[str, str, str, float]] = set()
+    implied: dict[tuple[str, str, str, float], str] = {}
+    failed_keys: set[tuple[str, str, str, float]] = set()
+    for row in forecasts.itertuples(index=False):
+        key = _affected_key(row)
+        if str(row.status) != "ok":
+            failed_keys.add(key)
+            affected.add(key)
+            continue
+        reason = _row_invalid_reason(row)
+        if reason is not None:
+            affected.add(key)
+            implied[key] = reason
+
+    documented: set[tuple[str, str, str, float]] = set()
+    duplicates = 0
+    blank = 0
+    reasons: dict[tuple[str, str, str, float], str] = {}
+    for row in failures.itertuples(index=False):
+        key = _affected_key(row)
+        if key in documented:
+            duplicates += 1
+        documented.add(key)
+        text = _reason_text(row.reason)
+        if not text:
+            blank += 1
+        reasons[key] = text
+
+    missing = sorted(affected - documented)
+    orphaned = sorted(documented - affected)
+    contradicting = sorted(key for key, reason in implied.items() if reasons.get(key, "") != reason)
+    unresolvable = sorted(key for key in failed_keys if not reasons.get(key))
+
+    passed = not missing and not orphaned and not duplicates and not blank and not contradicting and not unresolvable
+    _record(
+        checks,
+        "failure_reasons_cover_affected_keys",
+        passed,
+        f"affected keys={len(affected)} (failed={len(failed_keys)}, invalid outputs={len(implied)}); "
+        f"documented={len(documented)}; missing={len(missing)}" + (f" e.g. {missing[:2]}" if missing else "")
+        + f"; documented but unaffected={len(orphaned)}" + (f" e.g. {orphaned[:2]}" if orphaned else "")
+        + f"; duplicate keys={duplicates}; blank reasons={blank}"
+        + f"; invalid output without its recomputed reason={len(contradicting)}"
+        + (
+            f" e.g. {[(key, reasons.get(key, ''), implied[key]) for key in contradicting[:2]]}"
+            if contradicting
+            else ""
+        )
+        + f"; failed row with no reason={len(unresolvable)}"
+        + (f" e.g. {unresolvable[:2]}" if unresolvable else ""),
+    )
+
+
+def _current_source_hash(module_name: str) -> tuple[str | None, str | None, str]:
+    """The file the imported module came from, and the sha256 of its bytes *now*.
+
+    Two facts are being kept apart. *Which file this process imported* is answered by
+    ``sys.modules``; *what that file contains at this moment* is answered by hashing it. Only
+    the second is comparable to a recorded hash, so a file edited after import is caught
+    here while a claim that the already-loaded bytecode was re-read is not made: Python
+    caches imports, and hashing cannot undo that.
+
+    Returns ``(path, sha256, note)``; ``sha256`` is ``None`` when no bytes can be read, and
+    the note says why.
+    """
+    module = sys.modules.get(module_name)
+    if module is None:
+        # A verification process starts without any adapter imported. Importing here is not
+        # a new trust decision -- replaying already executes this module -- but it is what
+        # makes "the source of the factory in this process" a decidable statement.
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # noqa: BLE001 - an unimportable factory is the finding
+            return None, None, f"module {module_name!r} could not be imported: {exc}"
+    path = getattr(module, "__file__", None)
+    if not path:
+        return None, None, f"module {module_name!r} has no source file (namespace or built-in)"
+    try:
+        return str(path), hashlib.sha256(Path(path).read_bytes()).hexdigest(), ""
+    except OSError as exc:
+        return str(path), None, f"module file unreadable: {exc}"
+
+
+def _factory_source_check(
+    checks: list[dict], model_id: str, factory: Any, record: Any
+) -> None:
+    """Compare the factory importable now with the provenance the run recorded.
+
+    Disagreement is a failure: identity or hash, either means the artifacts were produced by
+    source that is no longer on disk, so every other check is describing code that is not the
+    code in front of the verifier. A missing hash or an unreadable module is **unavailable**
+    instead — an absence of evidence stated as such, since "I could not compare" and "I
+    compared and agreed" are not the same claim.
+    """
+    name = f"custom_factory_source:{model_id}"
+    if not isinstance(record, dict):
+        _record(
+            checks,
+            name,
+            False,
+            "no provenance entry was recorded for this model, so the imported factory cannot "
+            "be compared with the source that produced these artifacts",
+        )
+        return
+
+    recorded_hash = record.get("module_sha256")
+    if record.get("factory") != factory.factory:
+        # Identity is decidable from the configuration alone, so it is checked before
+        # anything is imported.
+        _record(
+            checks,
+            name,
+            False,
+            f"recorded factory {record.get('factory')!r} vs configured {factory.factory!r}",
+        )
+        return
+
+    path, current_hash, note = _current_source_hash(factory.module_name)
+    if not recorded_hash:
+        _record(
+            checks,
+            name,
+            False,
+            "the run recorded no source hash "
+            f"({record.get('module_hash_note') or 'no note'}), so the imported source cannot "
+            f"be compared with the source that produced these artifacts; current file "
+            f"{path or 'unavailable'}. Unavailable coverage, not a pass",
+            applicable=False,
+            unavailable=True,
+        )
+        return
+    if current_hash is None:
+        _record(
+            checks,
+            name,
+            False,
+            f"a source hash was recorded but the current source is unreadable ({note}), so "
+            "the two cannot be compared. Unavailable coverage, not a pass",
+            applicable=False,
+            unavailable=True,
+        )
+        return
+
+    moved = (
+        f"; imported file {path} differs from the recorded {record.get('module_file')}"
+        if record.get("module_file") and str(record["module_file"]) != path
+        else ""
+    )
+    _record(
+        checks,
+        name,
+        current_hash == recorded_hash,
+        f"factory={factory.factory}; recorded sha256={recorded_hash[:16]}... "
+        f"current sha256={current_hash[:16]}...{moved}"
+        + (
+            ""
+            if current_hash == recorded_hash
+            else "; the imported source is not the source that produced these artifacts"
+        ),
+    )
+
+
+def _declared_builtin_capabilities(model_id: str, resolved: dict) -> tuple[int, str] | None:
+    """Warm-up and replay mode the toolkit assigns to a built-in id, from its own rules.
+
+    Derived from the same declarations the adapters use, not from the recorded manifest: the
+    point of the comparison is that the two are computed independently.
+    """
+    if model_id == MODEL_HISTORICAL:
+        window = resolved.get("historical_window")
+        if not isinstance(window, int) or isinstance(window, bool) or window < 1:
+            return None
+        return historical_minimum_history(window), "none"
+    if model_id == MODEL_GARCH_T:
+        return GARCH_MINIMUM_HISTORY, "none"
+    if model_id == MODEL_JOINT_MLP:
+        return MLP_MINIMUM_HISTORY, "checkpoint"
+    return None
+
+
+def _capability_checks(
+    checks: list[dict],
+    resolved: dict,
+    manifest: dict,
+    expected_models: set[str],
+    instances: dict[str, Any] | None = None,
+) -> None:
+    """Recorded capabilities must match the specification reconstructed from the code.
+
+    ``manifest.model_coverage`` freezes each model's declared warm-up and replay mode, and
+    the completeness and replay checks then trust those numbers. If the declarations have
+    changed since, the recorded numbers no longer describe the adapter that would run, and
+    verification would be measuring a promise the code no longer makes — a model that used
+    to need 101 observations and now needs 63 could shrink its own expected key set simply by
+    being edited. For a custom adapter the reconstruction is the adapter itself; for a
+    built-in it is the toolkit's declaration for that id, which needs no construction.
+    """
+    coverage = manifest.get("model_coverage") or {}
+    instances = instances or {}
+    for model_id in sorted(expected_models):
+        entry = coverage.get(model_id) or {}
+        if not isinstance(entry, dict):
+            entry = {}
+        adapter = instances.get(model_id)
+        if adapter is not None:
+            spec = getattr(adapter, "spec", None)
+            if spec is None:
+                _record(
+                    checks,
+                    f"model_capabilities_match:{model_id}",
+                    False,
+                    "the factory returned an adapter without a .spec, so its capabilities "
+                    "cannot be reconstructed",
+                )
+                continue
+            expected_history = int(spec.minimum_history)
+            expected_replay = str(spec.replay_mode)
+            origin = "the adapter rebuilt from configuration"
+        else:
+            declared = _declared_builtin_capabilities(model_id, resolved)
+            if declared is None:
+                if model_id in (resolved.get("custom_models") or {}):
+                    # A configured custom model with no rebuilt adapter was already reported
+                    # by the factory check; a second check of the same name would count twice.
+                    continue
+                _record(
+                    checks,
+                    f"model_capabilities_match:{model_id}",
+                    False,
+                    f"no capability rule is declared for {model_id!r}, so its recorded "
+                    "warm-up and replay mode cannot be reconstructed",
+                )
+                continue
+            expected_history, expected_replay = declared
+            origin = "the toolkit's declaration for this built-in id"
+
+        recorded_history = entry.get("minimum_history")
+        recorded_replay = entry.get("replay_mode")
+        problems = []
+        if recorded_history != expected_history:
+            problems.append(
+                f"minimum_history recorded={recorded_history!r} reconstructed={expected_history!r}"
+            )
+        if recorded_replay != expected_replay:
+            problems.append(
+                f"replay_mode recorded={recorded_replay!r} reconstructed={expected_replay!r}"
+            )
+        _record(
+            checks,
+            f"model_capabilities_match:{model_id}",
+            not problems,
+            f"reconstructed from {origin}: minimum_history={expected_history}, "
+            f"replay_mode={expected_replay!r}"
+            + ("" if not problems else "; " + "; ".join(problems))
+            + (
+                ""
+                if not problems
+                else "; the recorded capabilities no longer describe this model, so the "
+                "checks derived from them would verify the wrong contract"
+            ),
+        )
+
+
+def _custom_model_checks(
+    checks: list[dict],
+    directory: Path,
+    resolved: dict,
+    manifest: dict,
+    forecasts: pd.DataFrame,
+    sources: dict[str, "_Source"],
+    expected_models: set[str],
+) -> dict[str, Any]:
+    """Provenance, checkpoint integrity and no-fit replay for configured custom models.
+
+    A custom adapter is not reproducible from configuration alone: its code lives outside
+    this package, and a checkpointed one also needs whatever state it wrote. So the run
+    records what was imported and what was written, and this check re-derives the forecasts
+    from those artifacts with ``fit`` never called. What it cannot do is stated rather than
+    implied: importing a module says nothing about the rest of its dependency tree, about
+    files it reads at prediction time, or about whether its checkpoint was pretrained
+    somewhere this run did not observe.
+    """
+    from .models.registry import load_custom_checkpoint, resolve_custom_models
+
+    declared = resolved.get("custom_models") or {}
+    selected = [name for name in resolved.get("models", []) if name in declared]
+    if not selected:
+        return {}
+    try:
+        custom = resolve_custom_models(declared, selected=selected)
+    except Exception as exc:  # noqa: BLE001 - a factory that will not resolve is the finding
+        _record(checks, "custom_factories_resolve", False, f"declared factories do not resolve: {exc}")
+        return {}
+
+    recorded = manifest.get("custom_factories") or {}
+    missing_provenance = sorted(name for name in selected if name not in recorded)
+    unhashed = sorted(
+        name
+        for name in selected
+        if name in recorded and not (recorded[name] or {}).get("module_sha256")
+    )
+    _record(
+        checks,
+        "custom_factory_provenance",
+        not missing_provenance,
+        f"recorded={sorted(set(recorded) & set(selected))}; missing provenance={missing_provenance}"
+        + (f"; no module source hash for {unhashed} (module has no source file)" if unhashed else "")
+        + "; declared dependencies are author statements and are not verified here",
+    )
+
+    instances: dict[str, Any] = {}
+    for model_id in sorted(selected):
+        try:
+            instances[model_id] = custom[model_id].build()
+        except Exception as exc:  # noqa: BLE001 - an unbuildable adapter is the finding
+            _record(
+                checks,
+                f"model_capabilities_match:{model_id}",
+                False,
+                "the configured factory could not be built, so its declared capabilities "
+                f"cannot be reconstructed: {exc}",
+            )
+
+    # The provenance block is only worth something if it is compared back to the code that
+    # is importable now. A hash nobody checks records what ran, not what would run again.
+    # Checked after the factories above so the comparison is with the module this process
+    # actually imported.
+    for model_id in sorted(selected):
+        _factory_source_check(checks, model_id, custom[model_id], recorded.get(model_id))
+
+    coverage = manifest.get("model_coverage") or {}
+    checkpoints = manifest.get("checkpoints") or {}
+    grid = np.asarray([float(value) for value in resolved.get("alpha_grid", [])], dtype=float)
+
+    for model_id in sorted(selected):
+        entry = coverage.get(model_id) or {}
+        replay_mode = entry.get("replay_mode")
+        if replay_mode == "none":
+            _record(
+                checks,
+                f"checkpoint_replay:{model_id}",
+                False,
+                "replay_mode='none': the adapter ships no checkpoint, so its saved forecasts "
+                "cannot be reproduced independently. Unavailable coverage, not a pass",
+                applicable=False,
+                unavailable=True,
+            )
+            continue
+        if replay_mode != "checkpoint":
+            _record(
+                checks,
+                f"checkpoint_replay:{model_id}",
+                False,
+                f"model_coverage records replay_mode={replay_mode!r}; expected 'checkpoint' or 'none'",
+            )
+            continue
+
+        record = checkpoints.get(model_id)
+        if not isinstance(record, dict) or not record.get("files"):
+            _record(
+                checks,
+                f"checkpoint_files_match_manifest:{model_id}",
+                False,
+                "the run declares replay_mode='checkpoint' but records no checkpoint files, so "
+                "the promised artifact cannot be identified or replayed",
+            )
+            continue
+
+        root = directory / str(record.get("path"))
+        expected_files = record["files"]
+        missing = sorted(name for name in expected_files if not (root / name).is_file())
+        unrecorded = sorted(
+            name for name, meta in expected_files.items() if not (meta or {}).get("sha256")
+        )
+        mismatched = []
+        for name, meta in sorted(expected_files.items()):
+            if name in missing or not (meta or {}).get("sha256"):
+                continue
+            import hashlib
+
+            actual = hashlib.sha256((root / name).read_bytes()).hexdigest()
+            if actual != meta["sha256"]:
+                mismatched.append(name)
+        hash_ok = not missing and not unrecorded and not mismatched
+        _record(
+            checks,
+            f"checkpoint_files_match_manifest:{model_id}",
+            hash_ok,
+            f"path={record.get('path')}; files={sorted(expected_files)}; missing={missing}; "
+            f"no recorded hash={unrecorded}; sha256 mismatched={mismatched}"
+            + ("" if hash_ok else "; a deleted or replaced checkpoint is an integrity failure"),
+        )
+        if missing:
+            _record(
+                checks,
+                f"checkpoint_replay:{model_id}",
+                False,
+                f"checkpoint file(s) missing: {missing}; saved forecasts cannot be reproduced",
+            )
+            continue
+
+        minimum_history = entry.get("minimum_history")
+        if not isinstance(minimum_history, int) or isinstance(minimum_history, bool):
+            _record(
+                checks,
+                f"checkpoint_replay:{model_id}",
+                False,
+                "no integer minimum_history recorded, so the replay origin set is undefined",
+            )
+            continue
+
+        try:
+            # The loader receives the run directory, exactly as `save_checkpoint` did: the
+            # model owns its own layout inside it, and the recorded `path` is only how this
+            # verifier finds the files it must hash.
+            adapter = load_custom_checkpoint(custom[model_id], directory)
+        except Exception as exc:  # noqa: BLE001 - report an unusable checkpoint, do not crash
+            _record(checks, f"checkpoint_replay:{model_id}", False, f"checkpoint unusable for replay: {exc}")
+            continue
+
+        subset = forecasts[forecasts["model_id"] == model_id] if not forecasts.empty else forecasts
+        compared = 0
+        failures_matched = 0
+        mismatches = 0
+        requested = 0
+        answered = 0
+        examples: list[str] = []
+        try:
+            for source in sources.values():
+                rows = subset[subset["series_id"] == source.series_id]
+                if rows.empty:
+                    continue
+                saved = {_series_key(row): row for row in rows.itertuples(index=False)}
+                index_of = source.index_of
+                permitted = {int(value) for value in source.allowed_origins}
+                positions = sorted(
+                    {
+                        index_of[key[1]]
+                        for key in saved
+                        if key[1] in index_of and index_of[key[1]] in permitted
+                    }
+                )
+                if not positions:
+                    continue
+                for item in iter_prediction_inputs(
+                    source,
+                    path_id=f"{source.split}:replay",
+                    minimum_history=minimum_history,
+                    positions=np.asarray(positions, dtype=int),
+                ):
+                    requested += int(grid.size)
+                    # The replay is checked against the query, not against whatever the
+                    # loader happened to return: a dropped, duplicated, extra or reordered
+                    # alpha would otherwise leave the remaining comparisons agreeing while
+                    # the answer is incomplete.
+                    answers = check_forecast_sequence(
+                        adapter.predict_one(item, grid),
+                        grid,
+                        context=f"{model_id} replay {source.series_id}@{item.origin_label}",
+                    )
+                    answered += len(answers)
+                    for forecast in answers:
+                        key = (str(source.series_id), str(item.origin_label), round(float(forecast.alpha), 12))
+                        row = saved.get(key)
+                        if row is None:
+                            mismatches += 1
+                            examples.append(f"{key[0]}@{key[1]} a={key[2]}: replayed but not saved")
+                            continue
+                        if str(row.status) != forecast.status:
+                            mismatches += 1
+                            examples.append(
+                                f"{key[0]}@{key[1]} a={key[2]}: saved {row.status} vs replay {forecast.status}"
+                            )
+                            continue
+                        if forecast.status != "ok":
+                            failures_matched += 1
+                            continue
+                        compared += 1
+                        # A missing scale serializes as NaN and is not itself a defect, so
+                        # "absent on both sides" agrees; only two present scales are compared.
+                        saved_absent = bool(pd.isna(row.scale))
+                        replay_absent = forecast.scale is None or bool(pd.isna(forecast.scale))
+                        if saved_absent != replay_absent:
+                            scale_ok = False
+                        elif saved_absent:
+                            scale_ok = True
+                        else:
+                            scale_ok = np.isclose(
+                                float(row.scale), float(forecast.scale), rtol=1e-10, atol=1e-12
+                            )
+                        if not (
+                            np.isclose(float(row.var), forecast.var, rtol=1e-10, atol=1e-12)
+                            and np.isclose(float(row.es), forecast.es, rtol=1e-10, atol=1e-12)
+                            and scale_ok
+                        ):
+                            mismatches += 1
+                            examples.append(f"{key[0]}@{key[1]} a={key[2]}: numbers differ")
+        except Exception as exc:  # noqa: BLE001 - surface an actionable replay failure
+            _record(checks, f"checkpoint_replay:{model_id}", False, f"replay failed: {exc}")
+            continue
+
+        # `answered` is implied by the sequence check and `compared + failures_matched`
+        # must account for every requested cell; both are reported because "the loop ran"
+        # and "the query was covered" are different claims.
+        complete = answered == requested and compared + failures_matched == requested
+        _record(
+            checks,
+            f"checkpoint_replay:{model_id}",
+            mismatches == 0 and complete and compared > 0,
+            f"compared={compared} mismatches={mismatches} failed_rows={failures_matched}; "
+            f"requested={requested} answered={answered} (one forecast per queried alpha, in "
+            "query order, per origin); recomputed from the saved checkpoint and causal "
+            "histories only (fit never called)"
+            + ("" if complete else "; the replay did not cover every requested cell")
+            + (f" e.g. {examples[:3]}" if examples else ""),
+        )
+
+    # Returned so the capability cross-check can reuse the adapters instead of importing and
+    # building them a second time.
+    return instances
+
+
 def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
     """Verify actual artifacts of a run directory.
 
@@ -782,14 +1541,44 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
 
     alpha_grid = list(resolved.get("alpha_grid", []))
     expected_models = set(resolved.get("models", [MODEL_HISTORICAL]))
-    unknown_models = expected_models - _KNOWN_MODELS
+    # A model is legitimate when it is a built-in id or when this configuration declares
+    # its factory. The verifier does not keep a second roster of "approved" models: a
+    # registration that needed a verifier edit would not be a registration.
+    declared_custom = resolved.get("custom_models") or {}
+    if not isinstance(declared_custom, dict):
+        raise ArtifactVerificationError(
+            "config.resolved.json declares 'custom_models' as "
+            f"{type(declared_custom).__name__}; expected a JSON object"
+        )
+    acceptable = set(_KNOWN_MODELS) | set(declared_custom)
+    unknown_models = expected_models - acceptable
     if unknown_models:
         raise ArtifactVerificationError(
-            f"config.resolved.json declares unsupported models: {sorted(unknown_models)}; "
-            f"supported: {sorted(_KNOWN_MODELS)}"
+            f"config.resolved.json declares models that are neither built-in nor configured: "
+            f"{sorted(unknown_models)}; built-in: {sorted(_KNOWN_MODELS)}; declared under "
+            f"'custom_models': {sorted(declared_custom)}"
         )
 
-    for name in required_artifacts(dataset_kind, sorted(expected_models)):
+    # Contract dispatch: the marker is additive, so a run created before it keeps every
+    # legacy requirement and gains none of the v1 ones.
+    contract_version = manifest.get(CONTRACT_MARKER)
+    v1 = contract_version == CONTRACT_VERSION
+    if contract_version is None:
+        contract_detail = (
+            "absent: this run predates adapter contract v1, so legacy artifact requirements "
+            "and legacy verification semantics apply"
+        )
+    elif v1:
+        contract_detail = f"{CONTRACT_MARKER}=1"
+    else:
+        contract_detail = (
+            f"unsupported {CONTRACT_MARKER}={contract_version!r}; this verifier implements "
+            f"version {CONTRACT_VERSION} and cannot claim v1 coverage for it"
+        )
+
+    for name in required_artifacts(
+        dataset_kind, sorted(expected_models), adapter_contract_version=contract_version
+    ):
         if not (directory / name).exists():
             raise ArtifactVerificationError(f"missing required artifact: {directory / name}")
 
@@ -816,6 +1605,8 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
         manifest.get("schema_version") == 1,
         f"schema_version={manifest.get('schema_version')!r}",
     )
+
+    _record(checks, "adapter_contract_version_supported", contract_version is None or v1, contract_detail)
 
     config_hash_matches = False
     try:
@@ -939,17 +1730,29 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
         )
         ok_mask = forecasts["status"] == "ok"
         ok_finite = True
-        for col in ("alpha", "var", "es", "scale"):
+        for col in ("alpha", "var", "es"):
             values = pd.to_numeric(forecasts.loc[ok_mask, col], errors="coerce").to_numpy(dtype=float)
             if values.size and not np.all(np.isfinite(values)):
                 ok_finite = False
                 break
+        scale_values = pd.to_numeric(forecasts.loc[ok_mask, "scale"], errors="coerce").to_numpy(dtype=float)
+        scale_reported = int(np.isfinite(scale_values).sum())
+        if v1:
+            # Contract v1 allows a custom model to omit the optional scale (serialized as
+            # NaN). That is an absent diagnostic, not a defect; infinity never is one of the
+            # allowed absent values. Built-in models still must report it, which the
+            # capability-specific check below enforces.
+            scale_ok = not bool(np.any(np.isinf(scale_values)))
+        else:
+            scale_ok = bool(np.all(np.isfinite(scale_values))) if scale_values.size else True
         _record(
             checks,
             "forecast_values_finite",
-            realized_finite and ok_finite,
+            realized_finite and ok_finite and scale_ok,
             f"realized_return finite on all {len(forecasts)} rows; "
-            f"alpha/var/es/scale finite on {int(ok_mask.sum())} ok rows",
+            f"alpha/var/es finite on {int(ok_mask.sum())} ok rows; "
+            f"scale finite on {scale_reported} of {int(ok_mask.sum())}"
+            + ("" if scale_ok else "; scale contains an infinite value"),
         )
 
         statuses = set(forecasts["status"].astype(str).unique())
@@ -966,12 +1769,38 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
             es_vals = forecasts.loc[ok_mask, "es"].astype(float).to_numpy()
             scale_vals = forecasts.loc[ok_mask, "scale"].astype(float).to_numpy()
             ordering = bool(np.all(es_vals <= var_vals) and np.all(var_vals < 0.0))
-            positive_scale = bool(np.all(scale_vals > 0.0))
+            if v1:
+                present = np.isfinite(scale_vals)
+                positive_scale = bool(np.all(scale_vals[present] > 0.0))
+            else:
+                positive_scale = bool(np.all(scale_vals > 0.0))
         else:
             ordering = False
             positive_scale = False
         _record(checks, "original_unit_signed_ordering", ordering, "es <= var < 0 on ok rows")
-        _record(checks, "original_unit_positive_scale", positive_scale, "scale > 0 on ok rows")
+        _record(
+            checks,
+            "original_unit_positive_scale",
+            positive_scale,
+            "scale > 0 on ok rows"
+            + ("" if not v1 else " that report a scale (an omitted scale is NaN by contract)"),
+        )
+
+        if v1:
+            # The relaxation above must not become a loophole for the built-ins, whose
+            # scale is part of their documented output.
+            builtin_models = sorted(expected_models & _KNOWN_MODELS)
+            if builtin_models:
+                subset = forecasts[forecasts["model_id"].isin(builtin_models) & ok_mask]
+                unreported = int(
+                    pd.isna(pd.to_numeric(subset["scale"], errors="coerce")).sum()
+                ) if len(subset) else 0
+                _record(
+                    checks,
+                    "builtin_scale_reported",
+                    unreported == 0,
+                    f"built-in models={builtin_models}; rows without a scale={unreported} of {len(subset)}",
+                )
 
     # --- oracle table checks ---------------------------------------------------
     if not real:
@@ -1044,6 +1873,22 @@ def verify_run_artifacts(run_dir: str | Path) -> tuple[list[dict], bool]:
             _mlp_forecast_keys_check(checks, resolved, forecasts, sources)
             _mlp_failure_checks(checks, forecasts, failures, sources)
             _mlp_checkpoint_checks(checks, directory, resolved, manifest, forecasts, sources)
+        if v1:
+            # Generic coverage for every executed model, including the built-ins: the
+            # per-model sweep is derived from each adapter's own declared warm-up rather
+            # than from a name, so a newly registered model is covered without an edit.
+            _generic_completeness_checks(
+                checks, resolved, manifest, forecasts, sources, expected_models
+            )
+            _failure_union_checks(checks, forecasts, failures)
+            custom_instances = _custom_model_checks(
+                checks, directory, resolved, manifest, forecasts, sources, expected_models
+            )
+            # Last, because it audits the numbers every check above derived its expectations
+            # from: recorded warm-up and replay mode against the reconstructed adapter.
+            _capability_checks(
+                checks, resolved, manifest, expected_models, custom_instances
+            )
     elif sources:
         _record(checks, "replay_possible", False, "no forecast rows to replay")
 

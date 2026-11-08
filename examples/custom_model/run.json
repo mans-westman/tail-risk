@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "run_id": "example_local_2026",
+  "dataset_id": "example_local",
+  "data": {
+    "kind": "returns_panel",
+    "panel": "outputs/example_local/dataset/panel.csv",
+    "audit": "outputs/example_local/dataset/data_audit.json"
+  },
+  "alpha_grid": [0.005, 0.01, 0.025, 0.05, 0.1, 0.2],
+  "historical_window": 100,
+  "models": ["historical_simulation", "garch_student_t", "example_empirical"],
+  "custom_models": {
+    "example_empirical": {
+      "factory": "examples.custom_model.model:create_model",
+      "settings": {"window": 60},
+      "seed": 101,
+      "dependencies": []
+    }
+  },
+  "protocol": "Frozen before running: 100-return trailing window for historical simulation, example_empirical window 60, one GARCH-t fit on train only, six alpha levels, splits by target date from the ingestion cutoffs. Not retuned after seeing results."
+}

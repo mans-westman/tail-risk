@@ -385,11 +385,12 @@ class ModelSpec:
                 f"ModelSpec.contract_version {version} is not supported by this toolkit "
                 f"(supported: {CONTRACT_VERSION})"
             )
-        history = self.minimum_history
-        if not isinstance(history, int) or isinstance(history, bool) or history < 1:
+        history = require_integer(self.minimum_history, name="ModelSpec.minimum_history")
+        if history < 1:
             raise ContractError(
                 f"ModelSpec.minimum_history must be a positive integer, got {history!r}"
             )
+        object.__setattr__(self, "minimum_history", history)
         low = _require_finite_float(self.alpha_min, name="ModelSpec.alpha_min")
         high = _require_finite_float(self.alpha_max, name="ModelSpec.alpha_max")
         if not 0.0 < low <= high < SUPPORTED_ALPHA_MAX:
@@ -417,9 +418,10 @@ def historical_minimum_history(window: int) -> int:
     exactly, including the case where the 63-return warm-up is the binding constraint
     (``window < 63``) and the case where the window is (``window >= 63``).
     """
-    if not isinstance(window, int) or isinstance(window, bool) or window < 1:
-        raise ContractError(f"window must be a positive integer, got {window!r}")
-    return max(window + 1, MLP_MINIMUM_HISTORY)
+    count = require_integer(window, name="window")
+    if count < 1:
+        raise ContractError(f"window must be a positive integer, got {count!r}")
+    return max(count + 1, MLP_MINIMUM_HISTORY)
 
 
 # --------------------------------------------------------------------------------------
@@ -569,9 +571,51 @@ class TailRiskModel(Protocol):
         ...
 
 
+class CheckpointedModel(Protocol):
+    """The optional checkpoint capability, required when ``spec.replay_mode`` is
+    ``"checkpoint"``.
+
+    ``save_checkpoint`` writes files and returns ``None``: persistence is a side effect, and
+    a saver that also returns provenance invites callers to depend on a value a different
+    saver may not produce. What was written is asked for separately, after the fact, through
+    :meth:`checkpoint_metadata`, whose only guarantee is that it describes the last
+    successful write and raises before one. Keeping the two apart is what lets the runner
+    drive any conforming saver — including one that returns nothing at all — without
+    knowing the file layout.
+    """
+
+    def save_checkpoint(self, directory: Any) -> None:  # pragma: no cover - declaration
+        ...
+
+    def checkpoint_metadata(self) -> dict[str, Any]:  # pragma: no cover - declaration
+        ...
+
+
 # --------------------------------------------------------------------------------------
 # small scalar helpers
 # --------------------------------------------------------------------------------------
+
+
+def require_integer(value: Any, *, name: str = "value") -> int:
+    """Return an exact integer index, or raise.
+
+    Accepted: Python ``int`` and NumPy integer scalars (``np.int32``, ``np.int64``, ...).
+    Rejected: booleans (``bool``/``np.bool_`` — they are integers in Python and would
+    silently become 0 or 1), floats even when integral (``3.0``), strings, and anything
+    else. No truncation, rounding or parsing happens anywhere: an index helper that calls
+    ``int(value)`` turns ``3.7`` into ``3`` and reports the wrong origin instead of
+    failing, which is exactly the error class this contract exists to prevent.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        raise ContractError(
+            f"{name} must be an integer index, got the boolean {value!r}; "
+            "booleans are not positions"
+        )
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    raise ContractError(
+        f"{name} must be an integer index, got {type(value).__name__} ({value!r})"
+    )
 
 
 def _require_text(value: Any, *, name: str) -> str:
@@ -614,7 +658,9 @@ __all__ = [
     "Forecast",
     "ModelSpec",
     "TailRiskModel",
+    "CheckpointedModel",
     "owning_read_only",
+    "require_integer",
     "label_sort_keys",
     "historical_minimum_history",
     "validate_query_alphas",

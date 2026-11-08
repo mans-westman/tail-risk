@@ -19,6 +19,7 @@ import pytest
 from tailrisk.cli import cmd_evaluate, cmd_report, cmd_run, cmd_verify
 from tailrisk.data import DataError, load_panel
 from tailrisk.models.garch_t import GarchStudentTModel
+from tailrisk.models.adapters import GarchStudentTAdapter
 
 CONTEXT = 101  # required_context + 1: the origin's own return plus its window
 REQUIRED = 100  # historical_window
@@ -449,27 +450,33 @@ def test_development_execution_never_hands_held_out_returns_to_the_model(tmp_pat
 
     ``test_development_execution_excludes_test_split`` reads the forecast artifact, which
     would still look clean if the test split were fitted or predicted and then filtered
-    out of the rows. This test observes what ``fit`` and ``predict`` actually receive.
+    out of the rows. This test observes what ``fit`` and ``predict_one`` actually receive.
+
+    Since S2.2 the GARCH adapter is driven one origin at a time through the public
+    contract, so ``predict_one`` receives a causal prefix rather than a whole split array.
+    The invariant is unchanged and is now checked at the tighter granularity: every prefix
+    handed to prediction must be a prefix of a declared split, and no prefix may contain a
+    held-out return.
     """
     returns, splits = _fixture()
     panel = _write_panel(tmp_path, _panel_frame(returns, splits))
     parsed = load_panel(panel)
 
     fitted: list[np.ndarray] = []
-    predicted: list[np.ndarray] = []
+    predicted: list[tuple[str, np.ndarray]] = []
     original_fit = GarchStudentTModel.fit
-    original_predict = GarchStudentTModel.predict
+    original_predict = GarchStudentTAdapter.predict_one
 
     def fit_spy(self, training_returns):
         fitted.append(np.array(training_returns, dtype=float, copy=True))
         return original_fit(self, training_returns)
 
-    def predict_spy(self, realized_returns, alphas):
-        predicted.append(np.array(realized_returns, dtype=float, copy=True))
-        return original_predict(self, realized_returns, alphas)
+    def predict_spy(self, inputs, alphas):
+        predicted.append((inputs.path_id, np.array(inputs.history, dtype=float, copy=True)))
+        return original_predict(self, inputs, alphas)
 
     monkeypatch.setattr(GarchStudentTModel, "fit", fit_spy)
-    monkeypatch.setattr(GarchStudentTModel, "predict", predict_spy)
+    monkeypatch.setattr(GarchStudentTAdapter, "predict_one", predict_spy)
 
     out = tmp_path / "out_scoped"
     config = _run_config(tmp_path, panel, splits=["train", "validation"], models=["garch_student_t"])
@@ -482,12 +489,17 @@ def test_development_execution_never_hands_held_out_returns_to_the_model(tmp_pat
     assert np.array_equal(fitted[0], parsed["train"].returns), "fitting saw more than the train split"
     assert not np.array_equal(fitted[0], held_out)
 
-    assert len(predicted) == 2, "one prediction pass per declared split"
-    for received in predicted:
-        assert any(np.array_equal(received, part) for part in declared), (
-            "predict received a series that is not a declared split"
+    expected = sum(
+        len(parsed[name].scored_origin_indices) for name in ("train", "validation")
+    )
+    assert len(predicted) == expected, "one prediction per permitted origin of the declared splits"
+    for path_id, received in predicted:
+        assert any(np.array_equal(received, part[: received.size]) for part in declared), (
+            f"prediction on {path_id!r} received a series that is not a prefix of a declared split"
         )
-        assert not np.array_equal(received, held_out), "held-out test returns reached the model"
+        assert not np.array_equal(received, held_out[: received.size]), (
+            "held-out test returns reached the model"
+        )
 
 
 def test_load_panel_rejects_unscored_training_rows_extending_beyond_cutoff(tmp_path):

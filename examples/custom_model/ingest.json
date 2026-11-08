@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "dataset_id": "example_local",
+  "source": {
+    "kind": "returns_csv",
+    "path": "data/returns.csv",
+    "series_id": "example_local",
+    "provenance": "Locally generated, deterministic closed-form series (no RNG); regenerate with examples/custom_model/make_demo_returns.py. Synthetic integration example, not market data.",
+    "session_policy": "observed_sessions",
+    "gap_policy": "reject_unresolved"
+  },
+  "units": "decimal_log",
+  "cutoffs": {
+    "train_end": "2022-01-03",
+    "validation_end": "2022-04-25"
+  },
+  "context_returns": 101,
+  "required_context": 100,
+  "historical_window": 100,
+  "alpha_grid": [0.005, 0.01, 0.025, 0.05, 0.1, 0.2],
+  "exposure": "Synthetic example: no market exposure, no investment claim. Used only to exercise local ingestion, a custom adapter and verified checkpoint replay."
+}

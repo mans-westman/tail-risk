@@ -1,11 +1,11 @@
-"""Runner input construction for the public adapter contract (S2.1 scope).
+"""Runner for the public adapter contract (S2.1 inputs, S2.2 dispatch).
 
 This module builds the two things an adapter is allowed to see — a
 :class:`~tailrisk.models.protocol.FitPartition` and one
-:class:`~tailrisk.models.protocol.PredictionInput` per origin — from the existing
-series contexts. It performs no fitting, imports no estimator, schedules no prediction
-and writes no file; those arrive with the adapters in S2.2, which is why nothing here is
-reachable from the CLI yet.
+:class:`~tailrisk.models.protocol.PredictionInput` per origin — from the existing series
+contexts, and (from S2.2) drives a fitted adapter over every split of a run. It writes no
+file itself: the CLI keeps ownership of artifacts, so the legacy artifact requirements
+survive the refactor unchanged.
 
 Two rules are enforced here rather than left to documents.
 
@@ -26,16 +26,24 @@ origin_index + 1``), so no eligibility rule changes; only its enforcement moves.
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from dataclasses import dataclass
+from typing import Any, Iterator, Mapping, Protocol, Sequence
 
 import numpy as np
 
+from .models.adapters import create_model
 from .models.protocol import (
     ContractError,
     FitPartition,
+    Forecast,
+    ModelSpec,
     PredictionInput,
+    check_forecast_sequence,
+    invalid_output_reason,
     label_sort_keys,
     owning_read_only,
+    require_integer,
+    validate_query_alphas,
 )
 
 #: Offset from an origin position to its target: target ``j`` is predicted from origin
@@ -87,15 +95,17 @@ def origin_start_for(minimum_history: int) -> int:
 
     A prediction needs ``minimum_history`` observations *at* the origin inclusive, so
     position ``o`` is permitted exactly when ``o + 1 >= minimum_history``. For the
-    built-ins this reproduces the current first-forecast origins exactly: 100 for
-    historical simulation with ``window = 1000`` (``max(window + 1, 63) - 1``) and 62 for
-    GARCH–t and the MLP (``63 - 1 = FEATURE_WARMUP - 1``).
+    built-ins this reproduces the current first-forecast origins exactly: **1000** for
+    historical simulation with ``window = 1000`` (``max(1000 + 1, 63) - 1``) and **62**
+    for GARCH–t and the MLP (``63 - 1 = FEATURE_WARMUP - 1``).
+
+    ``minimum_history`` must be an exact integer; booleans and floats are rejected rather
+    than coerced (see :func:`tailrisk.models.protocol.require_integer`).
     """
-    if not isinstance(minimum_history, int) or isinstance(minimum_history, bool):
-        raise ContractError(f"minimum_history must be an integer, got {minimum_history!r}")
-    if minimum_history < MIN_TARGET_INDEX:
-        raise ContractError(f"minimum_history must be >= 1, got {minimum_history}")
-    return minimum_history - 1
+    history = require_integer(minimum_history, name="minimum_history")
+    if history < MIN_TARGET_INDEX:
+        raise ContractError(f"minimum_history must be >= 1, got {history}")
+    return history - 1
 
 
 def permitted_origins(
@@ -116,12 +126,12 @@ def permitted_origins(
     values = np.asarray(allowed_origins)
     if values.size == 0:
         return owning_read_only(np.asarray([], dtype=int), name=name, dtype=int)
-    if not np.issubdtype(values.dtype, np.number):
-        raise ContractError(f"{name} must be numeric positions, got dtype {values.dtype}")
-    numeric = values.astype(float, copy=False)
-    if not np.all(np.isfinite(numeric)) or np.any(numeric != np.floor(numeric)):
-        raise ContractError(f"{name} must contain integer positions")
-    positions = np.unique(numeric.astype(int))
+    if values.dtype == np.bool_ or not np.issubdtype(values.dtype, np.integer):
+        raise ContractError(
+            f"{name} must be an integer array, got dtype {values.dtype}; booleans and "
+            "floating-point positions are rejected rather than truncated"
+        )
+    positions = np.unique(values)
 
     last_origin = size - MAX_TARGET_INDEX_OFFSET
     lowest, highest = int(positions[0]), int(positions[-1])
@@ -155,10 +165,12 @@ def build_fit_partition(
     ``allowed_origins ∩ [minimum_history - 1, len - 2]`` — exactly the set the existing
     adapters fit on.
 
-    ``cutoff_label``, when given, is the last label fitting may use: every eligible target
-    must be labelled at or before it, and a violation raises instead of trimming. The
-    label is *not* stored on the partition (the contract has no such field); the caller
-    records it in the run manifest, which is where a reviewer looks for it.
+    ``cutoff_label``, when given, is the last label fitting may use, and it constrains the
+    whole exposed path, not just the eligible targets: every position in ``returns`` must
+    be labelled at or before it. An eligible-target-only check would pass a partition
+    whose tail — which the adapter can read — runs past the cutoff, so an overlong path
+    raises instead of being trimmed. The label is *not* stored on the partition (the
+    contract has no such field); the caller records it in the run manifest.
 
     An empty eligible set raises: every Stage 2 adapter is supervised, and a fit that
     cannot happen has to stop the run rather than produce forecasts from an unfit model.
@@ -184,7 +196,7 @@ def build_fit_partition(
         )
 
     if cutoff_label is not None:
-        _check_cutoff(items, targets, cutoff_label, series_id=series_id, path_id=path_id)
+        _check_cutoff(items, cutoff_label, series_id=series_id, path_id=path_id)
 
     return FitPartition(
         series_id=str(series_id),
@@ -197,17 +209,23 @@ def build_fit_partition(
 
 def _check_cutoff(
     labels: tuple[str, ...],
-    targets: np.ndarray,
     cutoff_label: str,
     *,
     series_id: str,
     path_id: str,
 ) -> None:
-    """Every eligible target must be labelled at or before ``cutoff_label``."""
+    """Every return exposed to fitting must be labelled at or before ``cutoff_label``.
+
+    The check covers the *whole path*, not only the eligible targets. ``FitPartition``
+    hands the adapter its entire ``returns`` array, so a path whose tail continues past
+    the cutoff leaks those observations even when no eligible target sits there. An
+    entry is never dropped to make the test pass: the caller must build the partition
+    from a path that already ends at its cutoff.
+    """
     keys = label_sort_keys(labels)
     cutoff_key = label_sort_keys((str(cutoff_label),))[0]
     try:
-        beyond = [labels[int(position)] for position in targets if keys[int(position)] > cutoff_key]
+        beyond = [label for label, key in zip(labels, keys) if key > cutoff_key]
     except TypeError as exc:
         raise ContractError(
             f"cutoff label {cutoff_label!r} is not comparable with the labels of series "
@@ -215,9 +233,11 @@ def _check_cutoff(
         ) from exc
     if beyond:
         raise ContractError(
-            f"{len(beyond)} eligible target(s) for series {series_id!r} path {path_id!r} "
-            f"fall after the fitting cutoff {cutoff_label!r}, first {beyond[0]!r}; "
-            "trim permitted origins before building the partition, do not fit across the cutoff"
+            f"{len(beyond)} of {len(labels)} return(s) for series {series_id!r} path "
+            f"{path_id!r} are exposed to fitting but labelled after the cutoff "
+            f"{cutoff_label!r}, first {beyond[0]!r}; the partition must end at its cutoff — "
+            "pass a path that the caller has already bounded, do not rely on the eligible "
+            "targets being inside it"
         )
 
 
@@ -269,7 +289,7 @@ def build_prediction_input(
         )
     if values.ndim != 1:
         raise ContractError(f"returns must be one-dimensional, got shape {values.shape}")
-    position = int(origin_index)
+    position = require_integer(origin_index, name="origin_index")
     if position < 0 or position > values.size - 1:
         raise ContractError(
             f"origin index {position} outside [0, {values.size - 1}] for a path of "
@@ -295,13 +315,54 @@ def build_prediction_input(
     )
 
 
+def iter_prediction_inputs(
+    context: Any,
+    *,
+    path_id: str,
+    minimum_history: int,
+    positions: Any | None = None,
+) -> Iterator[PredictionInput]:
+    """Yield one prediction input per permitted origin, in origin order.
+
+    Lazily, and that is the point: every input owns a detached copy of its prefix, so
+    materialising the whole split would keep ``n`` prefixes of average length ``n / 2``
+    alive at once — quadratic memory for a linear-looking loop. Yielding keeps one prefix
+    alive at a time; the copies are still owning and read-only, so an adapter still cannot
+    reach a later return through ``.base`` or by writing in place.
+
+    ``positions`` may be supplied when the caller has already computed the permitted set
+    (the runner does, to report coverage), which keeps the count and the yields identical
+    by construction rather than by two agreeing computations.
+    """
+    series_id, returns, labels, allowed = _context_fields(context)
+    permitted = (
+        permitted_origins(allowed, size=returns.size, minimum_history=minimum_history)
+        if positions is None
+        else positions
+    )
+    for position in permitted:
+        index = int(position)
+        yield build_prediction_input(
+            series_id=series_id,
+            path_id=path_id,
+            origin_index=index,
+            origin_label=labels[index],
+            returns=returns,
+            labels=labels,
+        )
+
+
 def prediction_inputs(
     context: Any,
     *,
     path_id: str,
     minimum_history: int,
 ) -> tuple[PredictionInput, ...]:
-    """One prediction input per permitted origin of one series context, in origin order.
+    """All prediction inputs for one series context, materialised.
+
+    A convenience for callers that want to hold the sequence (tests, inspection). The
+    production path consumes :func:`iter_prediction_inputs` instead, so a run never holds
+    every prefix at once.
 
     The set is derived from ``allowed_origins`` and ``minimum_history`` only, so the
     adapter cannot choose its own scored subset. An origin that survives this filter but
@@ -309,31 +370,321 @@ def prediction_inputs(
     no permitted origin yields an empty tuple, and the caller reports it rather than
     substituting another path.
     """
-    series_id, returns, labels, allowed = _context_fields(context)
-    positions = permitted_origins(
-        allowed, size=returns.size, minimum_history=minimum_history
-    )
     return tuple(
-        build_prediction_input(
-            series_id=series_id,
-            path_id=path_id,
-            origin_index=int(position),
-            origin_label=labels[int(position)],
-            returns=returns,
-            labels=labels,
+        iter_prediction_inputs(context, path_id=path_id, minimum_history=minimum_history)
+    )
+
+
+# --------------------------------------------------------------------------------------
+# driving an adapter over a run's splits (S2.2)
+# --------------------------------------------------------------------------------------
+
+SPLIT_TRAIN = "train"
+SPLIT_VALIDATION = "validation"
+
+#: Reason recorded when the *target* of an otherwise successful forecast is unusable.
+#: The runner owns the realized return, so this is the runner's finding, not the adapter's.
+REASON_NON_FINITE_TARGET = "non_finite_target"
+
+
+@dataclass(frozen=True)
+class ModelRun:
+    """One model's contribution to a run: rows, provenance and coverage counts."""
+
+    model_id: str
+    spec: ModelSpec
+    rows: list[dict[str, Any]]
+    summary: dict[str, Any]
+    coverage: dict[str, Any]
+
+
+def _split_of(context: Any, position: int) -> str:
+    split = getattr(context, "split", None)
+    return str(split) if split is not None else f"context{position}"
+
+
+def split_cutoffs(
+    contexts: Sequence[Any], declared: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """The last label each split may expose to fitting, per split.
+
+    A declared cutoff (a real panel's ``train_end`` / ``validation_end``) is used when the
+    run has one. A synthetic partition has no market date to declare, so its structural
+    boundary -- the label of its final return -- is used instead, which is still a real
+    check: a partition that grew past its own last label would be an internal
+    contradiction, and one that grew past a declared date is a protocol breach.
+    """
+    labels = {
+        _split_of(context, position): tuple(str(label) for label in context.origin_labels)
+        for position, context in enumerate(contexts)
+    }
+    resolved: dict[str, str] = {}
+    for split, items in labels.items():
+        if not items:
+            raise ContractError(f"split {split!r} has no labelled returns")
+        declared_value = None if declared is None else declared.get(split)
+        resolved[split] = str(declared_value) if declared_value is not None else items[-1]
+    return resolved
+
+
+def _contexts_by_split(contexts: Sequence[Any]) -> dict[str, Any]:
+    by_split: dict[str, Any] = {}
+    for position, context in enumerate(contexts):
+        split = _split_of(context, position)
+        if split in by_split:
+            raise ContractError(f"two series contexts claim the split {split!r}")
+        by_split[split] = context
+    return by_split
+
+
+def _row_for_forecast(
+    *,
+    run_id: str,
+    dataset_id: str,
+    series_id: str,
+    model_id: str,
+    data_seed: Any,
+    model_seed: Any,
+    origin_label: str,
+    target_label: str,
+    forecast: Forecast,
+    realized: float,
+    target_usable: bool,
+) -> dict[str, Any]:
+    """One saved forecast row, in the table's existing columns plus internal bookkeeping."""
+    scale = forecast.scale
+    status = forecast.status
+    reason = forecast.reason if status == "failed" else None
+    var = float(forecast.var)
+    es = float(forecast.es)
+    if status == "ok" and not target_usable:
+        # The adapter answered from causal information, but the row cannot be scored: the
+        # return it is scored against does not exist. Legacy marked such a row failed and
+        # dropped its numbers, so the saved table is unchanged.
+        status = "failed"
+        reason = REASON_NON_FINITE_TARGET
+        var = float("nan")
+        es = float("nan")
+    # A successful output can still be unusable (non-finite, or outside the supported
+    # domain). The row keeps its status and numbers so the evaluator counts it, and carries
+    # the reason under a private key that the saved table's column list drops; the CLI
+    # turns exactly those keys into the keyed reason artifact.
+    invalid_reason = invalid_output_reason(forecast) if status == "ok" else None
+    return {
+        "run_id": run_id,
+        "dataset_id": dataset_id,
+        "series_id": series_id,
+        "model_id": model_id,
+        "data_seed": data_seed,
+        "model_seed": model_seed,
+        "origin_date": origin_label,
+        "target_date": target_label,
+        "alpha": float(forecast.alpha),
+        "var": var,
+        "es": es,
+        "scale": float("nan") if scale is None else float(scale),
+        "realized_return": float(realized),
+        "status": status,
+        "_failure_reason": reason,
+        "_invalid_reason": invalid_reason,
+    }
+
+
+def run_model_instance(
+    model: Any,
+    *,
+    contexts: Sequence[Any],
+    alphas: Sequence[float],
+    run_id: str,
+    dataset_id: str,
+    cutoffs: Mapping[str, str] | None = None,
+    checkpoint_dir: Any | None = None,
+) -> ModelRun:
+    """Fit one adapter on ``train`` (and ``validation``) and forecast every split.
+
+    The order is fixed: partitions are built with declared cutoffs, the model is fitted
+    once, and only then are prediction inputs constructed per origin. Every adapter is
+    therefore handed a history that ends at the origin, and the realized return is joined
+    afterwards by this function -- an adapter cannot see the future even by accident.
+
+    Inputs are generated and consumed one at a time (see
+    :func:`iter_prediction_inputs`): each carries an owning read-only copy of its prefix,
+    so materialising a whole split would hold every prefix at once. Peak memory is instead
+    one prefix, plus the rows already written.
+    """
+    spec = model.spec
+    grid = validate_query_alphas(np.asarray(alphas, dtype=float), spec=spec)
+    by_split = _contexts_by_split(contexts)
+    if SPLIT_TRAIN not in by_split:
+        raise ContractError(
+            f"model {spec.model_id!r} must be fitted, but the run has no "
+            f"{SPLIT_TRAIN!r} split (splits: {sorted(by_split)})"
         )
-        for position in positions
+    boundaries = split_cutoffs(contexts, cutoffs)
+
+    train_partition = fit_partition_from_context(
+        by_split[SPLIT_TRAIN],
+        path_id=f"{dataset_id}:{SPLIT_TRAIN}",
+        minimum_history=spec.minimum_history,
+        cutoff_label=boundaries[SPLIT_TRAIN],
+    )
+    validation_partition = None
+    if spec.uses_validation:
+        if SPLIT_VALIDATION not in by_split:
+            raise ContractError(
+                f"model {spec.model_id!r} selects on validation but the run has no "
+                f"{SPLIT_VALIDATION!r} split"
+            )
+        validation_partition = fit_partition_from_context(
+            by_split[SPLIT_VALIDATION],
+            path_id=f"{dataset_id}:{SPLIT_VALIDATION}",
+            minimum_history=spec.minimum_history,
+            cutoff_label=boundaries[SPLIT_VALIDATION],
+        )
+
+    model.fit(train_partition, validation_partition)
+
+    seed = getattr(model, "model_seed", None)
+    model_seed: Any = "" if seed is None else int(seed)
+    rows: list[dict[str, Any]] = []
+    coverage: dict[str, Any] = {
+        "model_id": spec.model_id,
+        "replay_mode": spec.replay_mode,
+        "alpha_grid": [float(value) for value in grid],
+        "minimum_history": spec.minimum_history,
+        "splits": {},
+        "invalid_outputs": 0,
+    }
+
+    for position, context in enumerate(contexts):
+        split = _split_of(context, position)
+        series_id, returns, labels, allowed = _context_fields(context)
+        target_labels = getattr(context, "target_labels", None)
+        data_seed = getattr(context, "data_seed", "")
+        # Counted once, from the same array the inputs are generated from, so the reported
+        # coverage cannot drift from what was actually predicted.
+        permitted = permitted_origins(
+            allowed, size=returns.size, minimum_history=spec.minimum_history
+        )
+        inputs = iter_prediction_inputs(
+            context,
+            path_id=f"{dataset_id}:{split}",
+            minimum_history=spec.minimum_history,
+            positions=permitted,
+        )
+        counts = {"origins": int(permitted.size), "ok": 0, "failed": 0, "invalid_outputs": 0}
+        for item in inputs:
+            origin = item.history_length - 1
+            target = origin + 1
+            realized = float(returns[target])
+            target_usable = bool(np.isfinite(realized))
+            target_label = (
+                str(target_labels[origin])
+                if target_labels is not None and len(target_labels) > origin
+                else labels[target]
+            )
+            forecasts = check_forecast_sequence(
+                model.predict_one(item, grid),
+                grid,
+                context=f"{spec.model_id} {series_id}@{item.origin_label}",
+            )
+            for forecast in forecasts:
+                row = _row_for_forecast(
+                    run_id=run_id,
+                    dataset_id=dataset_id,
+                    series_id=series_id,
+                    model_id=spec.model_id,
+                    data_seed=data_seed,
+                    model_seed=model_seed,
+                    origin_label=item.origin_label,
+                    target_label=target_label,
+                    forecast=forecast,
+                    realized=realized,
+                    target_usable=target_usable,
+                )
+                if row["status"] == "ok" and row["_invalid_reason"] is not None:
+                    # Kept and counted: an out-of-domain number is an invalid output the
+                    # evaluator must see, not a row to delete. The reason reaches the
+                    # keyed reason artifact through run-forecast bookkeeping.
+                    counts["invalid_outputs"] += 1
+                    coverage["invalid_outputs"] += 1
+                counts["ok" if row["status"] == "ok" else "failed"] += 1
+                rows.append(row)
+        coverage["splits"][split] = counts
+
+    if spec.replay_mode == "checkpoint":
+        saver = getattr(model, "save_checkpoint", None)
+        if saver is None:
+            raise ContractError(
+                f"model {spec.model_id!r} declares replay_mode='checkpoint' but has no "
+                "save_checkpoint method"
+            )
+        if checkpoint_dir is None:
+            raise ContractError(
+                f"model {spec.model_id!r} needs an artifact directory to checkpoint into"
+            )
+        # The saver returns nothing (`save_checkpoint(directory) -> None`). What was written
+        # is asked for afterwards, through the separate optional accessor, so a saver that
+        # returns `None` -- the contract's own shape -- is sufficient.
+        saver(checkpoint_dir)
+        reader = getattr(model, "checkpoint_metadata", None)
+        metadata = dict(reader() or {}) if reader is not None else {}
+        coverage["checkpoint"] = {
+            "path": metadata.get("path"),
+            "files": sorted(metadata.get("files") or {}),
+            "described_by": "checkpoint_metadata" if reader is not None else "absent",
+        }
+
+    summary = model.summary()
+    return ModelRun(
+        model_id=spec.model_id,
+        spec=spec,
+        rows=rows,
+        summary=summary,
+        coverage=coverage,
+    )
+
+
+def run_model(
+    model_id: str,
+    *,
+    contexts: Sequence[Any],
+    alphas: Sequence[float],
+    settings: Mapping[str, Any],
+    seed: int | None,
+    run_id: str,
+    dataset_id: str,
+    cutoffs: Mapping[str, str] | None = None,
+    checkpoint_dir: Any | None = None,
+) -> ModelRun:
+    """Construct a built-in adapter and drive it through :func:`run_model_instance`."""
+    model = create_model(model_id, settings=settings, alphas=alphas, seed=seed)
+    return run_model_instance(
+        model,
+        contexts=contexts,
+        alphas=alphas,
+        run_id=run_id,
+        dataset_id=dataset_id,
+        cutoffs=cutoffs,
+        checkpoint_dir=checkpoint_dir,
     )
 
 
 __all__ = [
     "MIN_TARGET_INDEX",
     "MAX_TARGET_INDEX_OFFSET",
+    "SPLIT_TRAIN",
+    "SPLIT_VALIDATION",
     "SeriesContextLike",
+    "ModelRun",
     "origin_start_for",
     "permitted_origins",
     "build_fit_partition",
     "fit_partition_from_context",
     "build_prediction_input",
+    "iter_prediction_inputs",
     "prediction_inputs",
+    "split_cutoffs",
+    "run_model_instance",
+    "run_model",
 ]

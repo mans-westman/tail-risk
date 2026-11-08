@@ -67,6 +67,29 @@ REQUIRED_PANEL_COLUMNS = (
 
 RETURN_UNITS = {"decimal_log": 1.0, "percent_log": 0.01}
 
+# Local returns-CSV source (Stage 2, S2.3). A returns file is a declared input, not a
+# provider feed: it must name its own units, provenance and gap policy, and it carries
+# exactly two columns.
+RETURNS_CSV_COLUMNS = ("session_date", "return")
+RETURNS_CSV_SOURCE_KEYS = (
+    "kind",
+    "path",
+    "series_id",
+    "provenance",
+    "session_policy",
+    "gap_policy",
+    "gap_resolutions",
+)
+SUPPORTED_SESSION_POLICIES = ("observed_sessions",)
+SUPPORTED_GAP_POLICIES = ("reject_unresolved",)
+#: The only units a local returns CSV may declare in this version.
+RETURNS_CSV_SUPPORTED_UNITS = "decimal_log"
+
+#: Ingestion sources this importer implements. ``yahoo_chart`` is the original provider
+#: feed (fetch or reload one snapshot); ``returns_csv`` is the local declared file (S2.3)
+#: and never touches the network.
+SOURCE_KINDS = ("yahoo_chart", "returns_csv")
+
 # A closure of up to a long weekend is ordinary; anything longer is an audit finding
 # rather than something to delete or interpolate.
 DEFAULT_LONG_GAP_DAYS = 4
@@ -341,6 +364,241 @@ def normalise_returns(frame: pd.DataFrame, *, units: str) -> pd.DataFrame:
 # ------------------------------------------------------------------------------ splitting
 
 
+def _strict_iso_dates(values: pd.Series) -> pd.Series:
+    """Parse ``YYYY-MM-DD`` only. No inference, no partial formats, no epoch numbers."""
+    text = values.astype(str).str.strip()
+    shape = text.str.fullmatch(r"\d{4}-\d{2}-\d{2}")
+    if not bool(shape.all()):
+        offenders = text[~shape].head(3).tolist()
+        raise DataError(
+            f"session dates must be ISO YYYY-MM-DD strings; offenders: {offenders}"
+        )
+    parsed = pd.to_datetime(text, format="%Y-%m-%d", errors="coerce")
+    if parsed.isna().any():
+        offenders = text[parsed.isna()].head(3).tolist()
+        raise DataError(f"session dates are not valid calendar dates; offenders: {offenders}")
+    return parsed
+
+
+def read_returns_csv(path: str | Path, *, units: str = RETURNS_CSV_SUPPORTED_UNITS) -> pd.DataFrame:
+    """Read one local returns file into a validated, causally ordered frame.
+
+    The file is a *declared* input, so everything ambiguous is refused rather than guessed:
+    exactly the two required columns, ISO dates that are already strictly ascending, unique
+    dates, finite returns, and one declared unit convention. Sorting is not performed,
+    because a file that arrives out of order is a different file than the one the author
+    described, and silently reordering it would hide that.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise DataError(f"returns CSV not found: {path}")
+    frame = pd.read_csv(path, dtype={"session_date": str})
+    missing = [column for column in RETURNS_CSV_COLUMNS if column not in frame.columns]
+    if missing:
+        raise DataError(f"returns CSV is missing column(s): {missing}")
+    extra = sorted(set(frame.columns) - set(RETURNS_CSV_COLUMNS))
+    if extra:
+        raise DataError(
+            f"returns CSV carries unexpected column(s): {extra}; this mode accepts exactly "
+            f"{list(RETURNS_CSV_COLUMNS)}"
+        )
+    if frame.empty:
+        raise DataError("returns CSV contains no rows")
+
+    dates = _strict_iso_dates(frame["session_date"])
+    if not dates.is_monotonic_increasing:
+        first_break = int(np.flatnonzero(np.diff(dates.to_numpy()) < np.timedelta64(0, "ns"))[0])
+        raise DataError(
+            "returns CSV dates are not strictly ascending; no sorting is performed because "
+            f"the file order is the declared session order (first break at row {first_break})"
+        )
+    if dates.duplicated().any():
+        duplicate = dates[dates.duplicated()].iloc[0].strftime("%Y-%m-%d")
+        raise DataError(f"returns CSV repeats the session date {duplicate}")
+
+    returns = pd.to_numeric(frame["return"], errors="coerce")
+    if returns.isna().any():
+        offenders = frame.loc[returns.isna(), "session_date"].head(3).tolist()
+        raise DataError(f"returns CSV has non-numeric or missing returns at: {offenders}")
+    if not np.all(np.isfinite(returns.to_numpy(dtype=float))):
+        raise DataError("returns CSV contains non-finite returns")
+
+    ordered = frame.assign(session_date=dates).sort_values("session_date").reset_index(drop=True)
+    # ``normalise_returns`` is the shared unit conversion and degenerate-series guard; it is
+    # reached only after the file has been shown to be in order, so it cannot reorder input.
+    normalised = normalise_returns(ordered, units=units)
+    # Gap evidence, carried explicitly so a reader does not have to re-derive which session
+    # a return spans: the gap belongs to the session that *ends* it, and the previous
+    # session is kept beside it rather than inferred from the row order later.
+    normalised["previous_session"] = normalised["session_date"].shift(1)
+    elapsed = normalised["session_date"].diff().dt.days
+    normalised["elapsed_days"] = elapsed
+    normalised["spans_long_gap"] = (elapsed > DEFAULT_LONG_GAP_DAYS).fillna(False)
+    return normalised
+
+
+def resolve_gaps(
+    returns: pd.DataFrame, resolutions: dict[str, str] | None
+) -> dict[str, Any]:
+    """Require an explicit dated explanation for every flagged long gap.
+
+    A returns file cannot demonstrate that a gap is a market closure rather than a missing
+    observation, so the author must say which it is, date by date. Unresolved gaps stop
+    ingestion in this version; nothing is repaired, reindexed or forward-filled.
+    """
+    declared = dict(resolutions or {})
+    for key, value in declared.items():
+        if not isinstance(value, str) or not value.strip():
+            raise DataError(f"gap resolution for {key!r} must be a nonempty explanation")
+        _strict_iso_dates(pd.Series([str(key)]))
+
+    flagged = [
+        {
+            "session_date": row.session_date.strftime("%Y-%m-%d"),
+            "previous_session": (
+                None if pd.isna(row.previous_session) else row.previous_session.strftime("%Y-%m-%d")
+            ),
+            "elapsed_days": int(row.elapsed_days),
+        }
+        for row in returns.loc[returns["spans_long_gap"]].itertuples(index=False)
+    ]
+    flagged_dates = {gap["session_date"] for gap in flagged}
+    unresolved = sorted(date for date in flagged_dates if date not in declared)
+    if unresolved:
+        raise DataError(
+            f"{len(unresolved)} long gap(s) have no dated explanation: {unresolved[:5]}; "
+            "add each to source.gap_resolutions as return-ending date -> reason, or supply a "
+            "complete series. Nothing is filled, reindexed or dropped automatically"
+        )
+    unexplained = sorted(set(declared) - flagged_dates)
+    if unexplained:
+        raise DataError(
+            f"source.gap_resolutions explains date(s) that are not flagged gaps: {unexplained}; "
+            "a resolution for a date with no gap is a stale claim"
+        )
+    for gap in flagged:
+        gap["resolution"] = declared[gap["session_date"]]
+    return {"long_gap_count": len(flagged), "long_gaps": flagged, "unresolved_gaps": unresolved}
+
+
+def ingest_returns_csv(
+    config: dict[str, Any], *, base_dir: str | Path | None = None
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Build a panel plus audit from a declared local returns CSV. No network access."""
+    source = dict(config["source"])
+    declared_path = Path(str(source["path"]))
+    path = declared_path if declared_path.is_absolute() else Path(base_dir or ".") / declared_path
+
+    units = config.get("units", RETURNS_CSV_SUPPORTED_UNITS)
+    if units != RETURNS_CSV_SUPPORTED_UNITS:
+        raise DataError(
+            f"local returns CSV requires units {RETURNS_CSV_SUPPORTED_UNITS!r}, got {units!r}; "
+            "convert the file rather than letting the importer guess"
+        )
+
+    returns = read_returns_csv(path, units=units)
+    gaps = resolve_gaps(returns, source.get("gap_resolutions"))
+    panel, manifest = build_panel(
+        returns,
+        dataset_id=config["dataset_id"],
+        cutoffs=config["cutoffs"],
+        context_returns=int(config["context_returns"]),
+        required_context=int(config["required_context"]),
+    )
+    audit = build_returns_audit(
+        config=config,
+        source=source,
+        path=path,
+        returns=returns,
+        manifest=manifest,
+        panel=panel,
+        gaps=gaps,
+        raw_sha256=sha256_hex(path.read_bytes()),
+    )
+    return panel, audit
+
+
+def build_returns_audit(
+    *,
+    config: dict[str, Any],
+    source: dict[str, Any],
+    path: Path,
+    returns: pd.DataFrame,
+    manifest: dict[str, Any],
+    panel: pd.DataFrame,
+    gaps: dict[str, Any],
+    raw_sha256: str,
+) -> dict[str, Any]:
+    """The audit block for an imported returns file.
+
+    It reuses the panel contract's shape so `load_panel`, the runner and the verifier need
+    no special case, and records the two claims a returns file can actually make: which
+    bytes were read, and what the author declared about sessions and gaps. It cannot claim
+    the file is a complete exchange record, and does not.
+    """
+    declared = {
+        key: source.get(key)
+        for key in ("kind", "path", "series_id", "provenance", "session_policy", "gap_policy")
+    }
+    declared["resolved_path"] = str(path)
+    declared["gap_resolutions"] = {
+        gap["session_date"]: gap["resolution"] for gap in gaps["long_gaps"]
+    }
+    declared["raw_sha256"] = raw_sha256
+    declared["provider"] = "local file (no provider)"
+    declared["instrument"] = source.get("series_id")
+
+    scored = panel.loc[panel["is_scored"]]
+    return {
+        "schema_version": 1,
+        "dataset_id": config["dataset_id"],
+        "source": declared,
+        "coverage": {
+            "returns": int(len(returns)),
+            "first_return_target": returns["session_date"].min().strftime("%Y-%m-%d"),
+            "last_return_target": returns["session_date"].max().strftime("%Y-%m-%d"),
+        },
+        "validation": {
+            "rows_read": int(len(returns)),
+            "duplicate_dates": 0,
+            "non_finite_returns": 0,
+            "sorted_by_importer": False,
+            "session_policy": source.get("session_policy"),
+            "gap_policy": source.get("gap_policy"),
+            "long_gap_count": gaps["long_gap_count"],
+            "long_gaps": gaps["long_gaps"],
+            "unresolved_gaps": gaps["unresolved_gaps"],
+        },
+        "calendar": {
+            "status": "not checked",
+            "reason": (
+                "a local returns file carries no prices and no session calendar; session "
+                "completeness is the author's declaration, not something this import verifies"
+            ),
+        },
+        "units": {"returns": RETURNS_CSV_SUPPORTED_UNITS},
+        "splits": manifest,
+        "panel": {
+            "rows": int(len(panel)),
+            "scored_rows": int(len(scored)),
+            "scored_with_long_gap": int(scored["spans_long_gap"].sum()),
+            "columns": list(panel.columns),
+        },
+        "cross_check": None,
+        "exposure": {
+            "statement": config.get("exposure", "not declared"),
+            "test_period_not_wholly_unseen": None,
+            "detail": "Local file: exposure is whatever the author declares; this importer adds nothing.",
+        },
+        "limitations": [
+            "A returns file cannot prove that its sessions are a complete exchange record.",
+            "A date t labels the return ending at t; the author declares the preceding session it spans.",
+            "Gap explanations are author declarations retained as such, not verified closures.",
+            "Units are declared and never inferred; mixing percent and decimal files is a caller error.",
+        ],
+    }
+
+
 def assign_splits(target_dates: pd.Series, cutoffs: dict[str, str]) -> pd.Series:
     """Label each target date as train/validation/test using the declared cutoffs."""
     required = {"train_end", "validation_end"}
@@ -596,6 +854,14 @@ def build_audit(
 
 
 def load_ingest_config(path: str | Path) -> dict[str, Any]:
+    """Validate one ingestion config, dispatching on the declared source kind.
+
+    Two source kinds exist and they declare different things, so each has its own allowed
+    key set rather than one permissive union: a provider feed names an instrument, a
+    window and a price field; a local file names a path, units, provenance and a session
+    and gap policy. Accepting a key that the chosen kind cannot honour would let a config
+    claim something the import silently ignores.
+    """
     config = json.loads(Path(path).read_text(encoding="utf-8"))
     allowed = {
         "schema_version", "dataset_id", "source", "cutoffs", "context_returns",
@@ -607,15 +873,49 @@ def load_ingest_config(path: str | Path) -> dict[str, Any]:
     for key in ("dataset_id", "source", "cutoffs", "context_returns", "required_context"):
         if key not in config:
             raise DataError(f"ingest config is missing required key {key!r}")
+
+    source = config["source"]
+    kind = source.get("kind")
+    if kind not in SOURCE_KINDS:
+        raise DataError(
+            f"unsupported source kind {kind!r}; supported kinds are {list(SOURCE_KINDS)}"
+        )
+
+    if kind == "returns_csv":
+        unknown_source = sorted(set(source) - set(RETURNS_CSV_SOURCE_KEYS))
+        if unknown_source:
+            raise DataError(f"unknown source keys for a local returns CSV: {unknown_source}")
+        for key in ("path", "series_id", "provenance", "session_policy", "gap_policy"):
+            if key not in source:
+                raise DataError(
+                    f"local returns CSV source is missing required key {key!r}; a declared "
+                    "file must state its path, series, provenance and session/gap policy"
+                )
+        if source["session_policy"] not in SUPPORTED_SESSION_POLICIES:
+            raise DataError(
+                f"unsupported session_policy {source['session_policy']!r}; supported "
+                f"policies are {list(SUPPORTED_SESSION_POLICIES)}"
+            )
+        if source["gap_policy"] not in SUPPORTED_GAP_POLICIES:
+            raise DataError(
+                f"unsupported gap_policy {source['gap_policy']!r}; supported policies are "
+                f"{list(SUPPORTED_GAP_POLICIES)}"
+            )
+        units = config.get("units", RETURNS_CSV_SUPPORTED_UNITS)
+        if units != RETURNS_CSV_SUPPORTED_UNITS:
+            raise DataError(
+                f"local returns CSV requires units {RETURNS_CSV_SUPPORTED_UNITS!r}, got "
+                f"{units!r}; convert the file rather than letting the importer guess"
+            )
+        return config
+
     source_allowed = {
         "kind", "instrument", "price_field", "adjustment", "timezone", "currency",
         "requested_start", "requested_end",
     }
-    unknown_source = sorted(set(config["source"]) - source_allowed)
+    unknown_source = sorted(set(source) - source_allowed)
     if unknown_source:
         raise DataError(f"unknown source keys: {unknown_source}")
-    if config["source"].get("kind") != "yahoo_chart":
-        raise DataError(f"unsupported source kind {config['source'].get('kind')!r}")
     return config
 
 
@@ -649,12 +949,36 @@ def _sidecar_retrieval_time(raw_path: str | Path, raw_sha256: str) -> str:
 def ingest(
     config: dict[str, Any],
     *,
+    base_dir: str | Path | None = None,
     from_raw: str | Path | None = None,
     raw_cache: str | Path | None = None,
     reference_returns: pd.DataFrame | None = None,
     timeout: float = 60.0,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Fetch or reload one snapshot, validate it, build the panel, and assemble the audit."""
+    """Fetch or reload one snapshot, validate it, build the panel, and assemble the audit.
+
+    The source kind decides the path: a local returns CSV is a declared file, so it neither
+    fetches nor accepts the provider-feed options (a raw payload, a raw cache, a reference
+    series). Asking for those with a local file raises instead of being ignored, because a
+    silently dropped option is a claim the audit would then be unable to support.
+    """
+    if config["source"].get("kind") == "returns_csv":
+        supplied = [
+            name
+            for name, value in (
+                ("from_raw", from_raw),
+                ("raw_cache", raw_cache),
+                ("reference_returns", reference_returns),
+            )
+            if value is not None
+        ]
+        if supplied:
+            raise DataError(
+                f"local returns CSV ingestion does not accept {supplied}; a declared file is "
+                "read as-is, with no downloaded payload or reference series to compare against"
+            )
+        return ingest_returns_csv(config, base_dir=base_dir)
+
     source = config["source"]
     instrument = source["instrument"]
     start = source["requested_start"]
