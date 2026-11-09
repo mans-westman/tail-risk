@@ -58,3 +58,33 @@ def test_historical_requires_finite_input():
         historical_var_es([0.01, np.nan, 0.02], 0.05)
     with pytest.raises(ValueError):
         historical_var_es([0.01, 0.02], 1.5)
+
+
+def test_single_observation_tail_mass_returns_the_worst_observation():
+    """n*alpha < 1: the tail mean is the worst observation, not a rounded neighbour of it.
+
+    The value below is the one that exposed the defect: the general formula computed
+    ``(0.3 * q) / 0.3`` and returned ``q`` one ulp *above* the VaR, which the contract then
+    read as an invalid output (ES above VaR) for a numerically correct row.
+    """
+    worst = -0.015524696173177083
+    sample = np.array([worst] + [0.001] * 59)
+    var, es = historical_var_es(sample, alpha=0.005)
+    assert var == worst
+    assert es == worst
+    assert es == var  # bit-for-bit: no multiply-then-divide round trip
+
+
+def test_tail_mass_of_exactly_one_observation_is_also_the_worst_observation():
+    sample = np.array([-2.5] + [0.002] * 99)
+    var, es = historical_var_es(sample, alpha=0.01)  # boundary == 1.0 exactly
+    assert var == -2.5 and es == -2.5
+
+
+def test_fractional_mass_above_one_observation_still_averages():
+    sample = np.array([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    var, es = historical_var_es(sample, alpha=0.15)  # m=1.5, k=1, delta=0.5
+    # quantile = x_(2) = -2.0; ES = (x_(1) + 0.5 * x_(2)) / 1.5
+    assert var == pytest.approx(-2.0, abs=0.0)
+    assert es == pytest.approx((-3.0 + 0.5 * -2.0) / 1.5, rel=1e-15)
+    assert es < var  # the tail genuinely averages two observations

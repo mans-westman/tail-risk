@@ -11,6 +11,15 @@ def historical_var_es(returns: np.ndarray | list[float], alpha: float) -> tuple[
     ordered = np.sort(values)
     n = ordered.size
     boundary = n * alpha
+    if boundary <= 1.0:
+        # At most one observation of tail mass: the tail mean *is* the single worst
+        # observation, for both VaR and ES. Evaluating the general formula here divides a
+        # product by the same fractional mass it was multiplied by, and that round trip can
+        # return ES one ulp *above* VaR, which the contract reports as an invalid output for
+        # a row that is numerically correct. The general formula is unchanged below, where
+        # the tail actually averages more than one observation.
+        worst = float(ordered[0])
+        return worst, worst
     full_mass_count = int(np.floor(boundary))
     fractional_mass = boundary - full_mass_count
     quantile = ordered[int(np.ceil(boundary)) - 1]

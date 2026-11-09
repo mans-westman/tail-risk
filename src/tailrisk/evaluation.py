@@ -307,6 +307,86 @@ def _validate_forecast_rows(df: pd.DataFrame) -> None:
                 )
 
 
+def _prepare_forecasts(forecasts: pd.DataFrame) -> pd.DataFrame:
+    """Validate saved rows once and attach the scorable mask.
+
+    Scorable means the model returned a usable forecast: status ``ok``, finite numbers, and
+    a pair inside the signed domain ``es <= var < 0``. The domain clause is a project
+    requirement rather than an FZ0 one — FZ0 needs only ``es < 0`` — so an out-of-domain
+    output is excluded here and counted, never clipped into a score.
+    """
+    df = forecasts.copy()
+    _validate_forecast_rows(df)
+    df["origin_date"] = df["origin_date"].astype(str)
+    df["_chrono"] = df.groupby("series_id", sort=False)["origin_date"].transform(chronological_ranks)
+    df["alpha"] = df["alpha"].astype(float)
+    for column in ("var", "es", "realized_return"):
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    ok = df["status"] == "ok"
+    finite = (
+        np.isfinite(df["var"]) & np.isfinite(df["es"]) & np.isfinite(df["realized_return"])
+    )
+    # The full supported contract requires es <= var < 0.
+    # While FZ0 mathematically requires only es < 0, our project's valid forecast contract
+    # requires Expected Shortfall to be at least as severe as VaR, with negative return risk.
+    admissible = finite & (df["es"] <= df["var"]) & (df["var"] < 0.0)
+    df["scorable"] = ok & admissible
+    return df
+
+
+def _common_masks(
+    df: pd.DataFrame, roster: list[str]
+) -> dict[tuple[str, float], set[str]]:
+    """The shared scoring origins of each ``(series, alpha)`` cell.
+
+    One definition, used by the metrics and by every derived table. The mask is the
+    intersection of the models' scorable origins, so a difference between two models is
+    computed on identical returns. A configured model that emitted no row at all is a hard
+    error — the comparison would silently be partial — and a configured model missing from
+    one cell empties that cell instead of letting the others be scored alone (guide 7.3).
+    """
+    absent = [model for model in roster if model not in set(df["model_id"])]
+    if absent:
+        raise EvaluationError(
+            f"configured model(s) {absent} emitted no forecast rows; "
+            f"present: {sorted(set(df['model_id']))}. Scoring would compare against a partial roster"
+        )
+
+    masks: dict[tuple[str, float], set[str]] = {}
+    for (series_id, alpha), cell in df.groupby(["series_id", "alpha"]):
+        origins = [
+            set(group.loc[group["scorable"], "origin_date"])
+            for _, group in cell.groupby("model_id")
+        ]
+        masks[(series_id, alpha)] = set.intersection(*origins) if origins else set()
+        present = set(cell["model_id"])
+        if any(model not in present for model in roster):
+            masks[(series_id, alpha)] = set()
+    return masks
+
+
+def _scored_rows(
+    df: pd.DataFrame, masks: dict[tuple[str, float], set[str]], dataset_id: str
+) -> pd.DataFrame:
+    """Scorable rows that belong to their cell's common mask, in chronological order."""
+    rows = df[df["scorable"]].copy()
+    if rows.empty:
+        return rows
+    keep = np.array(
+        [
+            origin in masks.get((series, alpha), set())
+            for series, alpha, origin in zip(rows["series_id"], rows["alpha"], rows["origin_date"])
+        ],
+        dtype=bool,
+    )
+    rows = rows[keep].copy()
+    rows["split"] = [
+        _split_from_series(dataset_id, str(series)) for series in rows["series_id"]
+    ]
+    return rows.sort_values(["series_id", "alpha", "model_id", "_chrono"]).reset_index(drop=True)
+
+
 def evaluate_forecasts(
     forecasts: pd.DataFrame,
     oracle: pd.DataFrame,
@@ -334,25 +414,24 @@ def evaluate_forecasts(
     """
     if forecasts.empty:
         return _empty_metrics()
+    df = _prepare_forecasts(forecasts)
+    roster = list(dict.fromkeys(expected_models or ()))
+    return _metrics_from_prepared(df, oracle, dataset_id, roster, _common_masks(df, roster))
 
-    df = forecasts.copy()
-    _validate_forecast_rows(df)
-    df["origin_date"] = df["origin_date"].astype(str)
-    df["_chrono"] = df.groupby("series_id", sort=False)["origin_date"].transform(chronological_ranks)
-    df["alpha"] = df["alpha"].astype(float)
-    for column in ("var", "es", "realized_return"):
-        df[column] = pd.to_numeric(df[column], errors="coerce")
 
-    ok = df["status"] == "ok"
-    finite = (
-        np.isfinite(df["var"]) & np.isfinite(df["es"]) & np.isfinite(df["realized_return"])
-    )
-    # The full supported contract requires es <= var < 0.
-    # While FZ0 mathematically requires only es < 0, our project's valid forecast contract
-    # requires Expected Shortfall to be at least as severe as VaR, with negative return risk.
-    admissible = finite & (df["es"] <= df["var"]) & (df["var"] < 0.0)
-    df["scorable"] = ok & admissible
+def _metrics_from_prepared(
+    df: pd.DataFrame,
+    oracle: pd.DataFrame,
+    dataset_id: str,
+    roster: list[str],
+    masks: dict[tuple[str, float], set[str]],
+) -> pd.DataFrame:
+    """Score already-validated rows on the shared mask.
 
+    Separated from :func:`evaluate_forecasts` so the derived tables reuse one validated
+    frame and one mask set rather than rebuilding either; the numbers are the same ones
+    the public entry point has always produced.
+    """
     oracle_str = oracle.copy()
     if not oracle_str.empty:
         oracle_str["origin_date"] = oracle_str["origin_date"].astype(str)
@@ -361,36 +440,17 @@ def evaluate_forecasts(
     else:
         oracle_index = None
 
-    roster = list(dict.fromkeys(expected_models or ()))
-    absent = [model for model in roster if model not in set(df["model_id"])]
-    if absent:
-        raise EvaluationError(
-            f"configured model(s) {absent} emitted no forecast rows; "
-            f"present: {sorted(set(df['model_id']))}. Scoring would compare against a partial roster"
-        )
-
-    # Common scoring mask: intersection of scorable origins across every model that emitted
-    # rows for the cell. A model with no scorable row contributes an empty set, which empties
-    # the cell instead of letting the remaining models be scored alone (guide section 7.3).
-    masks: dict[tuple[str, float], set[str]] = {}
-    for (series_id, alpha), cell in df.groupby(["series_id", "alpha"]):
-        origins = [
-            set(group.loc[group["scorable"], "origin_date"])
-            for _, group in cell.groupby("model_id")
-        ]
-        masks[(series_id, alpha)] = set.intersection(*origins) if origins else set()
-
     records: list[dict] = []
     # Iterate over every emitted (series, alpha, model) cell, not only ok rows, so a
     # model that failed outright is reported with n=0 instead of vanishing. A configured
-    # model missing from a cell is added explicitly and empties that cell.
+    # model missing from a cell is added explicitly; `_common_masks` has already emptied
+    # that cell, so the remaining models cannot be scored alone.
     cell_keys = list(df.groupby(["series_id", "alpha", "model_id"]).size().index)
     for (series_id, alpha), cell in df.groupby(["series_id", "alpha"]):
         present = set(cell["model_id"])
         for model_id in roster:
             if model_id not in present:
                 cell_keys.append((series_id, alpha, model_id))
-                masks[(series_id, alpha)] = set()
 
     for series_id, alpha, model_id in cell_keys:
         available = df[
@@ -498,3 +558,363 @@ def evaluate_forecasts(
 
     table = pd.DataFrame.from_records(records, columns=METRICS_COLUMNS)
     return table.sort_values(["split", "model_id", "alpha"]).reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------------------
+# Derived tables (S2.4)
+#
+# These are additive artifacts: `metrics.csv` keeps its columns, and each table below
+# restates part of the same masked comparison in a form a reader can check by hand.
+# --------------------------------------------------------------------------------------
+
+DECOMPOSITION_COLUMNS = [
+    "series_id", "split", "model_id", "alpha", "n",
+    "mean_shortfall", "mean_ratio", "mean_log", "mean_fz0", "decomposition_residual",
+]
+
+PAIRED_COLUMNS = [
+    "series_id", "split", "model_id", "comparator_id", "comparator_kind", "alpha",
+    "n", "mean_fz0_model", "mean_fz0_comparator", "mean_difference",
+]
+
+CURVE_COLUMNS = [
+    "series_id", "split", "model_id", "alpha",
+    "n_origins", "n_admissible", "n_inadmissible",
+    "n_grids_complete", "n_grids_incomplete",
+    "var_crossings_with_next", "es_crossings_with_next", "n_pairs_with_next",
+]
+
+#: Conventional (non-neural) built-ins eligible as paired comparators. The classification
+#: is by id on purpose: it is not inferred from a configuration label, and an unknown
+#: custom model is never treated as a baseline merely because it emitted rows.
+CONVENTIONAL_BASELINE_IDS = ("historical_simulation", "garch_student_t")
+
+#: Tolerance on ``mean_fz0 - (mean_shortfall + mean_ratio + mean_log)``, applied as an
+#: absolute bound and as a relative one against the largest term. The identity is linear, so
+#: a violation is a coding defect rather than an approximation, but the rounding error grows
+#: with the magnitude of the terms and must not be mistaken for one.
+DECOMPOSITION_TOLERANCE = 1e-12
+
+
+def fz0_components(
+    y: np.ndarray, v: np.ndarray, e: np.ndarray, alpha: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The three additive terms of FZ0, elementwise.
+
+    ``shortfall = -max(v - y, 0) / (alpha * e)``, ``ratio = v / e - 1``,
+    ``log = log(-e)``; their sum is :func:`fz0_loss` exactly, because the indicator
+    ``1{y <= v}`` equals "``v - y`` is non-negative" and ``v/e + log(-e) - 1`` is
+    ``(v/e - 1) + log(-e)``. The split is reported, not re-weighted: no term is dropped,
+    rescaled or interpreted as a cost.
+    """
+    values = np.asarray(y, dtype=float)
+    var = np.asarray(v, dtype=float)
+    es = np.asarray(e, dtype=float)
+    shortfall = -np.maximum(var - values, 0.0) / (float(alpha) * es)
+    ratio = var / es - 1.0
+    log = np.log(-es)
+    return shortfall, ratio, log
+
+
+def decompose_scores(scored: pd.DataFrame) -> pd.DataFrame:
+    """Mean FZ0 per scored cell, split into its three terms.
+
+    Uses the same rows as :func:`evaluate_forecasts` — the frame produced by
+    :func:`_scored_rows` is already restricted to the common mask — so ``n`` and
+    ``mean_fz0`` here equal the corresponding rows of ``metrics.csv``. The residual is
+    recorded rather than asserted away, so a reader can see how far the identity holds.
+    """
+    if scored.empty:
+        return pd.DataFrame(columns=DECOMPOSITION_COLUMNS)
+
+    records: list[dict] = []
+    for (series_id, alpha, model_id), cell in scored.groupby(
+        ["series_id", "alpha", "model_id"], sort=False
+    ):
+        y = cell["realized_return"].to_numpy(dtype=float)
+        v = cell["var"].to_numpy(dtype=float)
+        e = cell["es"].to_numpy(dtype=float)
+        a = float(alpha)
+        shortfall, ratio, log = fz0_components(y, v, e, a)
+        fz0 = np.array([fz0_loss(yi, vi, ei, a) for yi, vi, ei in zip(y, v, e)])
+        mean_fz0 = float(np.mean(fz0))
+        mean_parts = float(np.mean(shortfall) + np.mean(ratio) + np.mean(log))
+        residual = mean_fz0 - mean_parts
+        scale = max(
+            1.0,
+            abs(mean_fz0),
+            abs(float(np.mean(shortfall))),
+            abs(float(np.mean(ratio))),
+            abs(float(np.mean(log))),
+        )
+        if abs(residual) > DECOMPOSITION_TOLERANCE * scale:
+            raise EvaluationError(
+                f"FZ0 decomposition does not close for series {series_id!r}, model "
+                f"{model_id!r}, alpha {a}: residual {residual!r} exceeds the stated "
+                f"{DECOMPOSITION_TOLERANCE:g} tolerance at scale {scale:g}"
+            )
+        records.append(
+            {
+                "series_id": series_id,
+                "split": str(cell["split"].iloc[0]),
+                "model_id": model_id,
+                "alpha": a,
+                "n": int(len(cell)),
+                "mean_shortfall": float(np.mean(shortfall)),
+                "mean_ratio": float(np.mean(ratio)),
+                "mean_log": float(np.mean(log)),
+                "mean_fz0": mean_fz0,
+                "decomposition_residual": residual,
+            }
+        )
+    table = pd.DataFrame.from_records(records, columns=DECOMPOSITION_COLUMNS)
+    return table.sort_values(["split", "model_id", "alpha"]).reset_index(drop=True)
+
+
+def paired_scores(
+    df: pd.DataFrame,
+    scored: pd.DataFrame,
+    masks: dict[tuple[str, float], set[str]],
+    dataset_id: str,
+    conventional: tuple[str, ...] = CONVENTIONAL_BASELINE_IDS,
+    roster: list[str] | None = None,
+) -> pd.DataFrame:
+    """Mean FZ0 of each model minus each conventional baseline, on the shared mask.
+
+    The difference is descriptive: ``n`` is the size of the common mask, the two means are
+    computed on the same origins, and no standard error, interval or significance marker is
+    produced. ``mean_difference < 0`` means the model has the lower (better) FZ0. A cell
+    with an empty mask keeps its row with ``n = 0`` and NaN means, so "nothing comparable"
+    is visible instead of absent.
+
+    A pair of conventional baselines is symmetric, so it is emitted once: a baseline model is
+    compared only against baselines that precede it in the configured roster. That rule is
+    restricted to baseline-to-baseline pairs. Suppressing a *model's* row because a baseline
+    happens to come later in the roster would drop the very comparison the table exists for,
+    and roster order is a configuration detail, not a statement about importance.
+    """
+    if df.empty:
+        return pd.DataFrame(columns=PAIRED_COLUMNS)
+
+    means: dict[tuple[str, float, str], float] = {}
+    for (series_id, alpha, model_id), cell in scored.groupby(
+        ["series_id", "alpha", "model_id"], sort=False
+    ):
+        y = cell["realized_return"].to_numpy(dtype=float)
+        v = cell["var"].to_numpy(dtype=float)
+        e = cell["es"].to_numpy(dtype=float)
+        a = float(alpha)
+        means[(series_id, a, model_id)] = float(
+            np.mean([fz0_loss(yi, vi, ei, a) for yi, vi, ei in zip(y, v, e)])
+        )
+
+    order = {model: index for index, model in enumerate(roster or [])}
+    records: list[dict] = []
+    for (series_id, alpha), cell in df.groupby(["series_id", "alpha"], sort=False):
+        present = set(cell["model_id"])
+        baselines = [name for name in conventional if name in present]
+        if not baselines:
+            continue
+        a = float(alpha)
+        n = int(len(masks.get((series_id, a), set())))
+        split = _split_from_series(dataset_id, str(series_id))
+        for model_id in sorted(present):
+            model_mean = means.get((series_id, a, model_id), float("nan"))
+            for baseline in sorted(baselines):
+                if baseline == model_id:
+                    continue
+                if (
+                    model_id in conventional
+                    and baseline in order
+                    and model_id in order
+                    and order[baseline] > order[model_id]
+                ):
+                    # Only a pair of *conventional baselines* is symmetric: both are the
+                    # comparator's own kind, so the difference and its negative say the same
+                    # thing. Keep it once, in roster order. A model that is not a baseline is
+                    # never suppressed: its difference to each baseline is the comparison the
+                    # table exists to report, whatever position the roster gives it.
+                    continue
+                base_mean = means.get((series_id, a, baseline), float("nan"))
+                difference = model_mean - base_mean
+                records.append(
+                    {
+                        "series_id": series_id,
+                        "split": split,
+                        "model_id": model_id,
+                        "comparator_id": baseline,
+                        "comparator_kind": "conventional_baseline",
+                        "alpha": a,
+                        "n": n,
+                        "mean_fz0_model": model_mean,
+                        "mean_fz0_comparator": base_mean,
+                        "mean_difference": difference,
+                    }
+                )
+    if not records:
+        return pd.DataFrame(columns=PAIRED_COLUMNS)
+    table = pd.DataFrame.from_records(records, columns=PAIRED_COLUMNS)
+    return table.sort_values(["split", "alpha", "model_id", "comparator_id"]).reset_index(drop=True)
+
+
+def curve_diagnostics(
+    forecasts: pd.DataFrame,
+    alpha_grid: list[float] | tuple[float, ...] | None = None,
+    dataset_id: str = "",
+) -> pd.DataFrame:
+    """Within-alpha admissibility and adjacent-alpha crossings, per (series, model, alpha).
+
+    Two different questions, kept in different columns. *Admissibility* is a property of a
+    single row: status ``ok``, finite numbers, ``es <= var < 0``. A *crossing* is a property
+    of a grid: for ascending alpha the signed VaR must not decrease and the ES must not
+    decrease either, so a level whose value exceeds the next level's is a crossing.
+
+    Crossings are counted only on origins whose whole grid is present and admissible, and
+    the number of such grids (`n_grids_complete`) is reported beside the count. An origin
+    with some levels missing is counted in `n_grids_incomplete` and contributes to no
+    crossing count, because comparing two of six levels is not a grid check. These counts
+    are structural: they say nothing about monotonicity between the reported alphas, about
+    an integrated quantile identity, or about any level not in the configured grid.
+    """
+    if forecasts.empty:
+        return pd.DataFrame(columns=CURVE_COLUMNS)
+
+    df = forecasts.copy()
+    _validate_forecast_rows(df)
+    df["origin_date"] = df["origin_date"].astype(str)
+    df["alpha"] = df["alpha"].astype(float)
+    for column in ("var", "es"):
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    admissible = (
+        (df["status"] == "ok")
+        & np.isfinite(df["var"])
+        & np.isfinite(df["es"])
+        & (df["es"] <= df["var"])
+        & (df["var"] < 0.0)
+    )
+    df["grid_admissible"] = admissible
+
+    if alpha_grid is None:
+        grid = sorted({round(float(value), 12) for value in df["alpha"]})
+    else:
+        grid = sorted({round(float(value), 12) for value in alpha_grid})
+
+    records: list[dict] = []
+    for (series_id, model_id), cell in df.groupby(["series_id", "model_id"], sort=False):
+        split = _split_from_series(dataset_id, str(series_id))
+        values: dict[tuple[str, float], tuple[float, float] | None] = {}
+        present: dict[str, set[float]] = {}
+        for row in cell.itertuples(index=False):
+            origin = str(row.origin_date)
+            level = round(float(row.alpha), 12)
+            present.setdefault(origin, set()).add(level)
+            values[(origin, level)] = (
+                (float(row.var), float(row.es)) if bool(row.grid_admissible) else None
+            )
+
+        complete = [
+            origin
+            for origin, levels in present.items()
+            if set(grid) <= levels and all(values.get((origin, level)) is not None for level in grid)
+        ]
+        complete_set = set(complete)
+        n_incomplete = sum(1 for origin in present if origin not in complete_set)
+
+        crossings: dict[float, tuple[int, int]] = {}
+        for left, right in zip(grid, grid[1:]):
+            crossed_var = 0
+            crossed_es = 0
+            for origin in complete:
+                var_left, es_left = values[(origin, left)]  # type: ignore[misc]
+                var_right, es_right = values[(origin, right)]  # type: ignore[misc]
+                crossed_var += int(var_left > var_right)
+                crossed_es += int(es_left > es_right)
+            crossings[left] = (crossed_var, crossed_es)
+
+        for level in grid:
+            origins_here = [origin for origin, levels in present.items() if level in levels]
+            n_admissible = sum(
+                1 for origin in origins_here if values.get((origin, level)) is not None
+            )
+            if level in crossings:
+                var_cross, es_cross = crossings[level]
+                n_pairs = len(complete)
+            else:
+                var_cross, es_cross, n_pairs = float("nan"), float("nan"), 0
+            records.append(
+                {
+                    "series_id": series_id,
+                    "split": split,
+                    "model_id": model_id,
+                    "alpha": level,
+                    "n_origins": len(origins_here),
+                    "n_admissible": int(n_admissible),
+                    "n_inadmissible": len(origins_here) - int(n_admissible),
+                    "n_grids_complete": len(complete),
+                    "n_grids_incomplete": int(n_incomplete),
+                    "var_crossings_with_next": var_cross,
+                    "es_crossings_with_next": es_cross,
+                    "n_pairs_with_next": int(n_pairs),
+                }
+            )
+    table = pd.DataFrame.from_records(records, columns=CURVE_COLUMNS)
+    return table.sort_values(["split", "model_id", "alpha"]).reset_index(drop=True)
+
+
+def _empty_curves() -> pd.DataFrame:
+    return pd.DataFrame(columns=CURVE_COLUMNS)
+
+
+def _empty_decomposition() -> pd.DataFrame:
+    return pd.DataFrame(columns=DECOMPOSITION_COLUMNS)
+
+
+def _empty_paired() -> pd.DataFrame:
+    return pd.DataFrame(columns=PAIRED_COLUMNS)
+
+
+@dataclass(frozen=True)
+class EvaluationResult:
+    """The four saved tables of one evaluation, all derived from one mask."""
+
+    metrics: pd.DataFrame
+    decomposition: pd.DataFrame
+    paired: pd.DataFrame
+    curves: pd.DataFrame
+
+    @property
+    def tables(self) -> dict[str, pd.DataFrame]:
+        return {
+            "metrics.csv": self.metrics,
+            "score_decomposition.csv": self.decomposition,
+            "paired_scores.csv": self.paired,
+            "curve_diagnostics.csv": self.curves,
+        }
+
+
+def evaluate_run(
+    forecasts: pd.DataFrame,
+    oracle: pd.DataFrame,
+    dataset_id: str,
+    expected_models: list[str] | None = None,
+    alpha_grid: list[float] | tuple[float, ...] | None = None,
+) -> EvaluationResult:
+    """Score one run and derive its comparison tables from a single shared mask.
+
+    ``metrics.csv`` remains the primary table; the other three are additive restatements
+    of the same masked rows (decomposition, pairing) or of the saved grid structure
+    (crossings). Nothing here fits, refits, downloads or drops a failed row.
+    """
+    if forecasts.empty:
+        return EvaluationResult(_empty_metrics(), _empty_decomposition(), _empty_paired(), _empty_curves())
+
+    df = _prepare_forecasts(forecasts)
+    roster = list(dict.fromkeys(expected_models or ()))
+    masks = _common_masks(df, roster)
+    scored = _scored_rows(df, masks, dataset_id)
+    return EvaluationResult(
+        metrics=_metrics_from_prepared(df, oracle, dataset_id, roster, masks),
+        decomposition=decompose_scores(scored),
+        paired=paired_scores(df, scored, masks, dataset_id, roster=roster),
+        curves=curve_diagnostics(forecasts, alpha_grid=alpha_grid, dataset_id=dataset_id),
+    )

@@ -25,6 +25,9 @@ data = ["pandas_market_calendars>=5"]
 # bound is the version whose `jax.random.split`/`fold_in` and float64 policy the tests
 # exercise; optax is bounded to the 0.2 series the clip-then-Adam chain was verified on.
 neural = ["jax>=0.4.30", "optax>=0.2,<0.3"]
+# Optional: the three fixed figures written by `tailrisk report --plots`. The Markdown and
+# JSON report do not import it, so evaluation and reporting still work without this extra.
+plots = ["matplotlib>=3.8"]
 
 [project.scripts]
 tailrisk = "tailrisk.cli:main"

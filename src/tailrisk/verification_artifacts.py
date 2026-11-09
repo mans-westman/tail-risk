@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .artifacts import read_artifact_csv
 from .data import DataError, load_panel, validate_cutoffs
 from .features import FEATURE_NAMES, FEATURE_WARMUP, build_feature_frame
 from .historical import historical_var_es
@@ -164,7 +165,9 @@ def _read_csv(path: Path, label: str, required_columns: list[str]) -> pd.DataFra
     if not path.exists():
         raise ArtifactVerificationError(f"missing required artifact {label}: {path}")
     try:
-        frame = pd.read_csv(path)
+        # Round-trip precision: the verifier recomputes reasons from these numbers, so a
+        # lossy parse would judge a row the run never wrote.
+        frame = read_artifact_csv(path)
     except Exception as exc:  # noqa: BLE001 - surface actionable message for any CSV parse failure
         raise ArtifactVerificationError(f"failed to read {label} {path}: {exc}") from exc
     missing = [col for col in required_columns if col not in frame.columns]

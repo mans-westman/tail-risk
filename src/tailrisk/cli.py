@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .artifacts import read_artifact_csv
 from .features import FEATURE_WARMUP, build_feature_frame
 from .historical import historical_var_es
 from .models.protocol import CONTRACT_VERSION, invalid_output_reason
@@ -1014,16 +1015,22 @@ def _read_run_csv(directory: Path, name: str) -> pd.DataFrame:
     path = directory / name
     if not path.exists():
         raise ArtifactVerificationError(f"missing required artifact: {path}")
-    return pd.read_csv(path)
+    # Round-trip precision: evaluation must see the float64 values that were written, not a
+    # re-rounded neighbour. A pair one ulp out of order is an invalid output, and a lossy
+    # read would score it as valid.
+    return read_artifact_csv(path)
 
 
 def cmd_evaluate(run_dir: str) -> int:
-    """Score saved forecasts on original-unit returns; writes metrics.csv only.
+    """Score saved forecasts on original-unit returns; writes the comparison tables.
 
-    The configured model roster is read from config.resolved.json, so a model that
+    `metrics.csv` stays the primary table and keeps its columns. The additive
+    `score_decomposition.csv`, `paired_scores.csv` and `curve_diagnostics.csv` are derived
+    from the same validated rows and the same common mask, so the four tables cannot drift
+    apart. The configured model roster is read from config.resolved.json, so a model that
     produced no rows fails evaluation instead of quietly shrinking the comparison.
     """
-    from .evaluation import EvaluationError, evaluate_forecasts
+    from .evaluation import EvaluationError, evaluate_run
 
     directory = Path(run_dir)
     if not directory.exists():
@@ -1043,17 +1050,31 @@ def cmd_evaluate(run_dir: str) -> int:
     dataset_id = str(resolved.get("dataset_id", "synthetic"))
     configured = resolved.get("models")
     roster = [str(model) for model in configured] if configured else None
+    alpha_grid = resolved.get("alpha_grid")
     try:
-        metrics = evaluate_forecasts(forecasts, oracle, dataset_id, expected_models=roster)
+        result = evaluate_run(
+            forecasts,
+            oracle,
+            dataset_id,
+            expected_models=roster,
+            alpha_grid=alpha_grid,
+        )
     except EvaluationError as exc:
         print(f"evaluation failed: {exc}", file=sys.stderr)
         return 2
-    if metrics.empty:
+    if result.metrics.empty:
         print("evaluation produced no metrics: no 'ok' forecast rows", file=sys.stderr)
         return 1
-    metrics_path = directory / "metrics.csv"
-    metrics.to_csv(metrics_path, index=False)
-    print(f"evaluation complete -> {metrics_path} ({len(metrics)} rows)")
+    for name, table in result.tables.items():
+        table.to_csv(directory / name, index=False)
+    print(
+        f"evaluation complete -> {directory / 'metrics.csv'} ({len(result.metrics)} rows); "
+        + ", ".join(
+            f"{name} ({len(table)} rows)"
+            for name, table in result.tables.items()
+            if name != "metrics.csv"
+        )
+    )
     if real:
         print("  oracle metrics undefined: market data has no ground-truth oracle")
     return 0
@@ -1174,150 +1195,21 @@ def cmd_ingest(
     return 0
 
 
-def cmd_report(run_dir: str) -> int:
-    """Assemble a concise report.md from existing artifacts (no recomputation)."""
-    directory = Path(run_dir)
-    if not directory.exists():
-        print(f"run directory not found: {directory}", file=sys.stderr)
-        return 2
+def cmd_report(run_dir: str, *, plots: bool = False) -> int:
+    """Render `report.md` and `report.json` from saved artifacts (no recomputation).
+
+    `reporting` owns the section order, the numbers and the figures; this wrapper only maps
+    outcomes to exit codes. `--plots` adds the three fixed figures and fails clearly when
+    Matplotlib is absent instead of writing a report that silently lacks them.
+    """
+    from .reporting import PlotDependencyError, ReportError, write_report
+
     try:
-        manifest = _read_json_artifact(directory / "manifest.json")
-        checks = _read_json_artifact(directory / "checks.json")
-    except ArtifactVerificationError as exc:
+        markdown_path, json_path = write_report(run_dir, plots=plots)
+    except (PlotDependencyError, ReportError) as exc:
         print(f"report failed: {exc}", file=sys.stderr)
         return 2
-    artifact_verification = None
-    av_path = directory / "artifact_verification.json"
-    if av_path.exists():
-        artifact_verification = _read_json_artifact(av_path)
-    metrics_path = directory / "metrics.csv"
-    if not metrics_path.exists():
-        print(
-            f"report requires metrics.csv; run `tailrisk evaluate --run {directory}` first",
-            file=sys.stderr,
-        )
-        return 2
-    metrics = pd.read_csv(metrics_path)
-
-    resolved = manifest.get("config_resolved", {})
-    real = (resolved.get("dataset_kind") or manifest.get("dataset_kind")) == "real"
-    data_info = manifest.get("data", {})
-    lines = [
-        "# Tail-risk run report",
-        "",
-        f"- Run id: {resolved.get('run_id', 'run')}",
-        f"- Created: {manifest.get('created_utc')}",
-        f"- Manifest status: {manifest.get('status')}",
-        f"- Data kind: {resolved.get('data_kind', 'synthetic_dgp')}",
-    ]
-    if real:
-        audit = data_info.get("audit") or {}
-        lines += [
-            f"- Panel: {data_info.get('panel')}",
-            f"- Snapshot SHA-256: {audit.get('raw_sha256')}",
-            f"- Retrieved (UTC): {audit.get('retrieved_at_utc')}",
-            f"- Instrument: {audit.get('instrument')} via {audit.get('provider')}",
-            f"- Returns per split: { {k: v.get('returns') for k, v in (data_info.get('splits') or {}).items()} }",
-            f"- Scored origins per split: { {k: v.get('scored_origins') for k, v in (data_info.get('splits') or {}).items()} }",
-        ]
-    else:
-        lines += [f"- DGP: {resolved.get('dgp')}", f"- Partitions: {resolved.get('partitions')}"]
-    lines += [
-        f"- Models: {resolved.get('models')}",
-        f"- Alpha grid: {resolved.get('alpha_grid')}",
-        f"- Runtime (s): {manifest.get('runtime_seconds')}",
-        "",
-        "## Independent checks",
-        "",
-    ]
-    if artifact_verification is not None:
-        applicable = [c for c in artifact_verification["checks"] if c.get("applicable", True)]
-        passed = sum(1 for c in applicable if c["passed"])
-        not_applicable = len(artifact_verification["checks"]) - len(applicable)
-        lines.append(
-            f"- Artifact verification: {passed}/{len(applicable)} applicable checks passed"
-            + (f"; {not_applicable} not applicable (no oracle exists for market data)" if not_applicable else "")
-            + " (see `artifact_verification.json`)"
-        )
-    else:
-        lines.append("- Artifact verification: not run yet (`tailrisk verify --run ...`)")
-    lines.append(
-        f"- Offline mathematical checks: "
-        f"{sum(1 for c in checks.get('checks', []) if c.get('passed'))}/{len(checks.get('checks', []))} passed"
-    )
-
-    lines += [
-        "",
-        "## Metrics by split, model, and alpha (original return units)",
-        "",
-        "Scores use a common scoring mask: within each (series, alpha) cell every model is",
-        "scored on the same origins, so `n` is identical across models. `avail` is the",
-        "model's emitted row count, `failed` rows with a non-ok status, `masked` rows removed",
-        "to reach the shared set. A model with no overlap appears with n=0, not omitted.",
-        "",
-        "| split | model | alpha | n | avail | failed | masked | mean FZ0 | mean QL | exceed obs/exp | Kupiec p | Christoffersen p | VaR RMSE | ES RMSE |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
-    ]
-
-    def _fmt(value: float, digits: int = 6) -> str:
-        return "nan" if not np.isfinite(value) else f"{value:.{digits}g}"
-
-    for row in metrics.itertuples(index=False):
-        lines.append(
-            f"| {row.split} | {row.model_id} | {row.alpha} | {row.n} | {row.n_available} | "
-            f"{row.n_failed_rows} | {row.n_dropped_by_mask} | {_fmt(row.mean_fz0)} | "
-            f"{_fmt(row.mean_quantile_loss)} | "
-            f"{row.exceedance_count}/{_fmt(row.exceedance_expected, 3)} | "
-            f"{_fmt(row.kupiec_p_uc, 4)} | {_fmt(row.christoffersen_p_ind, 4)} | "
-            f"{'-' if real else _fmt(row.var_rmse_vs_oracle)} | "
-            f"{'-' if real else _fmt(row.es_rmse_vs_oracle)} |"
-        )
-    lines += [
-        "",
-        "Backtest diagnostics: Kupiec is the unconditional-coverage LR test (df=1),",
-        "Christoffersen the first-order independence LR test (df=1). Its likelihood runs",
-        "over the chronologically adjacent pairs only, so `n_transitions` (= n-1 minus",
-        "chain breaks) is its sample size; `n_chain_breaks` counts pairs separated by a",
-        "scoring-mask or session gap, which break the chain instead of joining",
-        "non-adjacent days. Both counts are in `metrics.csv`. `nan` means the test was",
-        "undefined for that cell (empty transition row, e.g. no exceedances) and is",
-        "reported as undefined rather than imputed. Observed exceedance counts at",
-        "alpha=0.005 are very sparse by construction; non-rejection is not proof of",
-        "correct calibration.",
-    ]
-    lines += ["", "## Limitations", ""]
-    if real:
-        lines += [
-            "- One index, retrospective one-session-ahead forecasts. This is not a",
-            "  point-in-time vendor archive: the series is a dated snapshot and later",
-            "  vendor revisions are not modelled.",
-            "- No oracle exists for market data, so no oracle columns are reported and no",
-            "  implementation check substitutes for one. Backtests are the only evidence.",
-            "- Backtest non-rejection at sparse alphas is not calibration evidence, and mean",
-            "  FZ0/quantile-loss differences are descriptive, not a prespecified test.",
-            "- The estimator was frozen before these partitions were scored; any later",
-            "  change of window, alphas or model set is a new specification, not a rerun.",
-        ]
-    else:
-        lines += [
-            "- Synthetic smoke/development data only; no market data or statistical claims.",
-            "- Oracle comparisons use the privileged full-state synthetic oracle and are",
-            "  implementation checks, not forecasting skill evidence.",
-            "- Mean FZ0/quantile-loss comparisons across models are descriptive at this stage,",
-            "  not the prespecified research comparison.",
-        ]
-    lines += [
-        "",
-        "## Artifacts",
-        "",
-        "- `forecasts.csv`, `metrics.csv`" + ("" if real else ", `oracle_curves.csv`"),
-        "- `checks.json` (offline checks), `artifact_verification.json` (artifact checks)",
-        "- `manifest.json`, `summary.md`",
-    ]
-    report_path = directory / "report.md"
-    with open(report_path, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines) + "\n")
-    print(f"report complete -> {report_path}")
+    print(f"report complete -> {markdown_path} and {json_path}")
     return 0
 
 
@@ -1335,8 +1227,15 @@ def main(argv: list[str] | None = None) -> int:
     evaluate_p = sub.add_parser("evaluate", help="score saved forecasts; writes metrics.csv")
     evaluate_p.add_argument("--run", required=True, help="run output directory")
 
-    report_p = sub.add_parser("report", help="write report.md from existing artifacts")
+    report_p = sub.add_parser(
+        "report", help="write report.md and report.json from existing artifacts"
+    )
     report_p.add_argument("--run", required=True, help="run output directory")
+    report_p.add_argument(
+        "--plots",
+        action="store_true",
+        help="also draw the three fixed figures under plots/ (requires Matplotlib)",
+    )
 
     ingest_p = sub.add_parser(
         "ingest",
@@ -1362,7 +1261,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "evaluate":
         return cmd_evaluate(args.run)
     if args.command == "report":
-        return cmd_report(args.run)
+        return cmd_report(args.run, plots=args.plots)
     if args.command == "ingest":
         return cmd_ingest(
             args.config,
