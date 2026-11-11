@@ -1,0 +1,23 @@
+repo: 6a0a69a7e4a076dcbb95754fc4deffc819c99e69
+branch: main
+status:
+ M DIAGNOSTIC_20261104_fz0_decomposition.md
+?? configs/examples/gaussian_ewma.json
+?? evidence/
+?? examples/ewma_gaussian_adapter/
+?? tests/test_ewma_gaussian_adapter.py
+interpreter: Python 3.13.15 at .venv/bin/python
+versions: python 3.13.15 numpy 2.5.4 scipy 1.18.1 pandas 3.1.1 arch 8.0.0 matplotlib 3.11.2 pytest 9.2.0
+tailrisk: .venv/lib/python3.13/site-packages/tailrisk/__init__.py
+platform: Darwin 24.6.0 arm64
+paths: every path in this record is repository-relative; the repository root and the home
+directory are not printed.
+package copy: tailrisk imports from .venv/lib/python3.13/site-packages/tailrisk (a copied
+build, not an editable link); source-excluding-__pycache__ diff against src/tailrisk shows one
+extra module there, models/garch.py, which nothing in this workflow imports (all references are
+to models/garch_t.py). Not modified or removed; recorded as an environment observation.
+supplied model: examples/bring_your_model/ewma_gaussian.py has no working-tree change and no
+diff (it was read and called, never edited).
+new files: examples/ewma_gaussian_adapter/{__init__.py,model.py},
+configs/examples/gaussian_ewma.json, tests/test_ewma_gaussian_adapter.py, evidence/stage2/s26/.
+pre-existing unrelated change preserved: DIAGNOSTIC_20261104_fz0_decomposition.md (modified).
