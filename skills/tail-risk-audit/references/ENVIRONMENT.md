@@ -13,7 +13,7 @@ between the verifying interpreter and a run's manifest when a refit is involved.
 
 | Item | Value |
 |---|---|
-| Recorded | 2026-11-10; suite counts re-measured 2026-11-11 |
+| Recorded | 2026-11-10; suite counts re-measured 2026-11-11 (after the S2.6 adapter tests and the curve-figure regression test) |
 | Host | macOS 15.6, arm64 (`Darwin-arm64`) |
 | Interpreter | CPython 3.13.15, virtual environment created with `python3 -m venv .venv` |
 | Package | `tailrisk` 0.1.0, installed editable (`pip install -e ...`) |
@@ -69,8 +69,8 @@ about 23 with them.
 
 | Environment | Extras installed | Result |
 |---|---|---|
-| fresh venv (scratch directory, not committed) | `dev` + `plots` (`dev` already supplies `arch`); **no** `neural`, **no** `data` | **411 passed, 10 skipped in 16.7-24.5 s** |
-| development environment | `dev` + `neural` + `plots`; **no** `data` | **537 passed, 1 skipped in 67.3-180.8 s** |
+| fresh venv (scratch directory, not committed) | `dev` + `plots` (`dev` already supplies `arch`); **no** `neural`, **no** `data` | **423 passed, 10 skipped in 20.0-21.0 s** |
+| development environment | `dev` + `neural` + `plots`; **no** `data` | **549 passed, 1 skipped in 67.3-180.8 s** |
 
 The fresh environment was built by installing `.[baselines]`, then `.[plots]`, then `.[dev]`, so
 the net extras are `dev` + `plots`. Its 10 skips are explicit: six `joint_mlp` adapter-parity

@@ -132,3 +132,18 @@ reported as one.
 - No claim that the same label collision cannot appear elsewhere; this repair covers
   `_figure_curves`, which is where the review found it. `_figure_realized` already filters by
   split, and the S2.6 runs have one series per split, so it was not affected here.
+
+## 7. Subsequent visual review — 2026-11-11
+
+After the implementation agent's checks above, a separate reviewing assistant loaded and
+visually inspected all three corrected PNGs in `figures/`. The risk-curve figure shows a
+single validation series without the duplicated points and vertical segments seen in the
+superseded figure. The return panels explicitly label their model-specific available rows;
+the coverage figure has separate train and validation panels. Titles, legends and plotted
+content were readable. This closes the assistant visual-review gap recorded above; it is
+not a claim of human inspection or a replacement for numerical checks.
+
+The reviewer also ran the reporting and EWMA adapter tests against `src/`: 39 passed.
+Reference parity and `git diff --check` passed. No models were fitted and no scores were
+recomputed during this review. The original approval exchange remains unarchived; its
+narrative-only status is unchanged.

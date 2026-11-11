@@ -141,12 +141,23 @@ report says so.
 |---|---|---|
 | `realized_var_es_primary_alpha.png` | realized returns with VaR/ES and exceedance marks at alpha `0.025`, one panel per model | the run does not use `0.025`, or no admissible row exists at it |
 | `coverage_rate_vs_alpha.png` | observed exceedance rate versus alpha with the nominal rate as reference, one panel per split | no cell has a nonempty scored sample |
-| `curves_last_common_origin.png` | VaR and ES versus alpha at the last origin whose grid is complete for **every configured model** | no such origin exists, or a configured model produced nothing admissible |
+| `curves_last_common_origin.png` | VaR and ES versus alpha at the last origin, **on one series**, whose grid is complete for **every configured model** | no such origin exists, or a configured model produced nothing admissible |
 
 The primary alpha is fixed in advance. When a run does not use it the figure is omitted with
 a stated reason rather than drawn at a friendlier level. Splits are never joined into one
 line: their cells are different samples. The last-origin curves are a single descriptive
 snapshot, not a representative or live forecast.
+
+Origin labels belong to a series, not to a run: a train path and a validation path can both be
+labelled `1498`. The curve figure therefore selects on **(series, split, origin)** and draws
+exactly one value per model per configured alpha. Selecting on the label alone merged the two
+paths and drew two values per alpha — a defect found in review after the S2.6 trial.
+
+The two figures count different populations. The realized-return panels use each model's **own
+available rows** at the primary alpha, and each panel title reports that panel's `n` and
+exceedances; the scored tables, including the exceedance diagnostics, use the **common mask**.
+A model with more available rows can therefore show more plotted exceedances than its
+matched-sample count. That is a wider sample, not a different model.
 
 Matplotlib is optional (`pip install 'tailrisk[plots]'`). Without it, `report` writes the
 Markdown and JSON and `report --plots` fails with that installation command instead of

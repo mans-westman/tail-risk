@@ -694,3 +694,70 @@ def test_curve_figure_uses_the_configured_roster_from_the_manifest(tmp_path):
     artifacts = reporting.load_run(run)
     assert artifacts.roster == ("historical_simulation", "m")
     assert artifacts.roster_source == "config.resolved.json"
+
+
+def test_curve_figure_selects_one_series_not_every_path_with_the_same_label(tmp_path):
+    """Train and validation share numeric origin labels; the label alone must not merge them.
+
+    The S2.6 trial drew this figure by selecting `origin_date` alone, so both synthetic paths
+    contributed rows at origin 1498: every model got two values per alpha and the curve
+    zig-zagged between two different forecasts under a caption that named only validation.
+    """
+    alphas = (0.01, 0.025, 0.05)
+    origins = range(6)
+
+    def rows_for(split: str, shift: float) -> list[dict]:
+        return [
+            _row(
+                model,
+                origin,
+                alpha,
+                -0.03 - shift - 0.02 * (0.05 - alpha) / 0.05,
+                -0.04 - shift - 0.02 * (0.05 - alpha) / 0.05,
+                realized=0.01,
+                split=split,
+            )
+            for model in ("historical_simulation", "m")
+            for origin in origins
+            for alpha in alphas
+        ]
+
+    # Same labels, deliberately different forecasts, so a merged selection is detectable.
+    rows = rows_for("train", 0.05) + rows_for("validation", 0.0)
+    run = _write_run(
+        tmp_path, _frame(rows), models=["historical_simulation", "m"], alphas=list(alphas)
+    )
+
+    artifacts = reporting.load_run(run)
+    frame = reporting._plot_frame(artifacts)
+    grid = sorted({float(value) for value in frame["alpha"].dropna()})
+    series, origin, split, plotted = reporting._curve_selection(frame, grid, artifacts.roster)
+
+    assert split == "validation"
+    assert series == f"{DATASET}_validation"
+    assert set(plotted["series_id"]) == {f"{DATASET}_validation"}
+    assert set(plotted["origin_date"]) == {origin}
+
+    # Exactly one value per configured model per requested alpha.
+    counts = plotted.groupby(["model_id", "alpha"]).size()
+    assert set(counts.index) == {
+        (model, alpha) for model in artifacts.roster for alpha in alphas
+    }
+    assert (counts == 1).all(), counts[counts != 1]
+
+    # And the plotted values are the validation path's, not the train path's.
+    expected = _frame(rows_for("validation", 0.0))
+    expected = expected[expected["origin_date"] == origin]
+    for model_id in artifacts.roster:
+        got = plotted[plotted["model_id"] == model_id].sort_values("alpha")
+        want = expected[expected["model_id"] == model_id].sort_values("alpha")
+        assert np.allclose(got["var"], want["var"])
+        assert np.allclose(got["es"], want["es"])
+
+    # The rendered figure is still produced, and its caption names the series it used.
+    assert cmd_report(str(run), plots=True) == 0
+    payload = json.loads((run / "report.json").read_text(encoding="utf-8"))
+    entry = {item["name"]: item for item in payload["plots"]}["curves_last_common_origin"]
+    assert entry["available"] is True
+    assert f"series {DATASET}_validation" in entry["caption"]
+    assert (run / entry["path"]).is_file()

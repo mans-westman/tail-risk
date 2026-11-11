@@ -127,12 +127,17 @@ numerical artifacts before and after — `forecasts.csv`, `metrics.csv`,
 `score_decomposition.csv`, `paired_scores.csv` and `curve_diagnostics.csv` are byte-identical
 between the original run directory and the regenerated copy.
 
-Visual inspection: **not performed.** This runtime disables image bytes on the file-read path
+Visual inspection by the implementation agent: **not performed.** Its runtime disables image bytes on the file-read path
 and exposes no OCR or visual-question tool, so no claim of sight is made here. What was checked
 instead: each PNG opens and passes PIL `verify()` with the dimensions above; and the renderer
 was instrumented on the real artifacts, recording that it hands matplotlib six calls of six
 points each — one VaR and one ES line per configured model, every x value in the configured
 alpha grid. That is a check on the data the figure draws, not on how it looks.
+
+Subsequently, a separate reviewing assistant visually inspected all three corrected PNGs.
+See [the dated review in 04_REPAIR.md](04_REPAIR.md#7-subsequent-visual-review--2026-11-11).
+This is assistant visual review, not human inspection; the original runtime limitation remains
+part of the trial record.
 
 
 ## 6. What this record does and does not establish

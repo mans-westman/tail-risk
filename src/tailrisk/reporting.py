@@ -1139,6 +1139,11 @@ def _render_exceedance(report: dict) -> list[str]:
         "independence LR test over chronologically adjacent pairs (df=1). `undefined` means "
         "the test could not be computed for that cell and was not imputed.",
         "",
+        "These counts are on the **common mask**: every model is scored on the origins all of "
+        "them could produce, so `n` is identical across models within a cell. The realized-return "
+        "figure in §8 is drawn on each model's **own available rows** instead, which is why a "
+        "model can show more exceedances there than here (a wider sample, not a different model).",
+        "",
     ]
     rows = [
         [
@@ -1405,7 +1410,7 @@ def _figure_realized(artifacts: RunArtifacts, plt) -> dict:
         )
     fig.suptitle(
         f"Realized returns with VaR/ES at alpha={PRIMARY_ALPHA:g} ({split} split); "
-        "exceedance marks y <= VaR",
+        "exceedance marks y <= VaR on each model's available rows",
         fontsize=10,
     )
     fig.tight_layout(rect=(0.0, 0.05, 1.0, 1.0))
@@ -1418,7 +1423,9 @@ def _figure_realized(artifacts: RunArtifacts, plt) -> dict:
         "available": True,
         "path": f"{PLOT_DIRECTORY}/{PLOT_REALIZED}",
         "caption": f"realized returns and VaR/ES at alpha={PRIMARY_ALPHA:g}, {split} split, "
-        f"{len(models)} model panel(s); exceedance marks where y <= VaR",
+        f"{len(models)} model panel(s); exceedance marks where y <= VaR. Each panel uses that "
+        "model's own available rows at this alpha, so its n and exceedance count are not the "
+        "common-mask counts the scored tables report",
     }
 
 
@@ -1499,94 +1506,127 @@ def _figure_coverage(artifacts: RunArtifacts, plt) -> dict:
 
 
 def _complete_origins(cell: pd.DataFrame, alphas: list[float]) -> set[str]:
-    """Origins where every configured alpha level is present and plottable."""
+    """Origins where every configured alpha is present exactly once."""
     if cell.empty:
         return set()
-    counts = cell.groupby("origin_date")["alpha"].nunique()
-    return set(counts[counts >= len(alphas)].index.astype(str))
+    grouped = cell.groupby("origin_date")["alpha"]
+    counts = grouped.nunique()
+    sizes = grouped.size()
+    complete = (counts == len(alphas)) & (sizes == len(alphas))
+    return set(counts[complete].index.astype(str))
 
 
-def _last_common_complete_origin(
+def _curve_selection(
     frame: pd.DataFrame, alphas: list[float], models: tuple[str, ...]
-) -> tuple[str, str, None] | tuple[None, None, str]:
-    """Latest origin whose grid is complete for *every configured model*, and its split.
+) -> tuple[str, str, str, pd.DataFrame] | tuple[None, None, None, str]:
+    """Choose one series, its split and one origin, and return exactly the rows to plot.
 
-    The roster, not the surviving rows, decides what "every model" means: a model that was
-    configured and produced nothing admissible must make the figure unavailable rather than
-    be silently dropped, otherwise the plot would describe a smaller experiment than the run.
-    Origin labels are only comparable inside one path, so the search runs per split in the
-    figure's preference order (held-out first); ranking labels across splits would pick the
-    synthetic train path's last index and present it as the most recent date.
+    An origin label belongs to one path: a train series and a validation series can both be
+    indexed 0..1999, so the label alone does not identify a forecast. Selecting on the label
+    alone merged two paths into a single curve and drew two values per model per alpha, which
+    is what the S2.6 trial figures did. The selection is therefore (series, split, origin), and
+    it requires every configured model to have the whole alpha grid exactly once at that origin.
 
-    Returns ``(origin, split, None)`` on success and ``(None, None, reason)`` otherwise.
+    The roster, not the surviving rows, decides what "every model" means: a configured model
+    with nothing admissible makes the figure unavailable rather than being silently dropped.
+
+    Returns ``(series_id, origin, split, rows)`` on success and ``(None, None, None, reason)``
+    otherwise.
     """
     usable = frame[frame["plottable"]]
     if usable.empty:
-        return None, None, "no admissible forecast row exists, so no curve can be drawn"
+        return None, None, None, "no admissible forecast row exists, so no curve can be drawn"
     if not models:
-        return None, None, "the configured model roster is unavailable (no config.resolved.json)"
+        return None, None, None, (
+            "the configured model roster is unavailable (no config.resolved.json)"
+        )
     usable = usable.assign(plot_split=_split_of(usable))
 
-    available = {name: usable[usable["model_id"] == name] for name in models}
-    per_split: dict[str, list[set[str]]] = {}
-    for split in set(usable["plot_split"]):
-        per_split[split] = [
-            _complete_origins(cell[cell["plot_split"] == split], alphas)
-            for cell in available.values()
-        ]
-
-    order = [split for split in _SPLIT_PREFERENCE if split in per_split]
-    order += sorted(set(per_split) - set(order))
-    for split in order:
-        grids = per_split[split]
-        common = set.intersection(*grids) if grids else set()
-        if not common:
-            continue
-        ordered = chronological_ranks(pd.Series(sorted(common)))
-        return str(sorted(common)[int(np.argmax(ordered.to_numpy()))]), split, None
-
-    # Nothing lines up. Say which model is responsible, because "unavailable" without a
-    # cause is indistinguishable from a plotting bug.
-    nowhere = [name for name, cell in available.items() if cell.empty]
-    if nowhere:
-        return None, None, (
-            f"configured model(s) {', '.join(sorted(nowhere))} produced no admissible row, so "
+    missing = [name for name in models if name not in set(usable["model_id"])]
+    if missing:
+        return None, None, None, (
+            f"configured model(s) {', '.join(sorted(missing))} produced no admissible row, so "
             "no origin can be complete for every model"
         )
+
+    per_model = {name: usable[usable["model_id"] == name] for name in models}
+    series_split = {
+        row.series_id: row.plot_split
+        for row in usable[["series_id", "plot_split"]].drop_duplicates().itertuples()
+    }
+    order = [split for split in _SPLIT_PREFERENCE if split in set(usable["plot_split"])]
+    order += sorted(set(usable["plot_split"]) - set(order))
+
+    for split in order:
+        best: tuple[int, str, str] | None = None
+        for series in sorted(name for name, label in series_split.items() if label == split):
+            grids = [
+                _complete_origins(cell[cell["series_id"] == series], alphas)
+                for cell in per_model.values()
+            ]
+            common = set.intersection(*grids) if grids else set()
+            if not common:
+                continue
+            labels = sorted(common)
+            position = int(np.argmax(chronological_ranks(pd.Series(labels)).to_numpy()))
+            if best is None or position > best[0]:
+                best = (position, labels[position], series)
+        if best is not None:
+            _position, origin, series = best
+            rows = usable[
+                (usable["series_id"] == series) & (usable["origin_date"] == origin)
+            ]
+            return series, origin, split, rows
+
     scattered = [
-        name
-        for name, cell in available.items()
-        if not set().union(
-            *(_complete_origins(cell[cell["plot_split"] == split], alphas) for split in per_split)
+        name for name in models
+        if not any(
+            _complete_origins(cell[cell["series_id"] == series], alphas)
+            for cell in (per_model[name],)
+            for series in series_split
         )
     ]
     if scattered:
-        return None, None, (
+        return None, None, None, (
             f"configured model(s) {', '.join(sorted(scattered))} never have all "
             f"{len(alphas)} configured alpha levels admissible at one origin"
         )
-    return None, None, (
-        "every configured model has some complete grid, but never at the same origin in the "
-        "same split"
+    return None, None, None, (
+        "every configured model has some complete grid, but never at the same origin on the "
+        "same series"
     )
 
 
 def _figure_curves(artifacts: RunArtifacts, plt) -> dict:
-    """VaR/ES curves versus alpha at the last origin all models could evaluate."""
+    """VaR/ES curves versus alpha at one origin of one series, for the configured roster."""
     name = "curves_last_common_origin"
     frame = _plot_frame(artifacts)
     if frame.empty:
         return {"name": name, "available": False, "reason": "forecasts.csv is empty or absent"}
     alphas = sorted(set(float(value) for value in frame["alpha"].dropna()))
-    origin, split, reason = _last_common_complete_origin(frame, alphas, artifacts.roster)
-    if origin is None:
-        return {"name": name, "available": False, "reason": reason}
-    rows = frame[frame["origin_date"] == origin]
+    selection = _curve_selection(frame, alphas, artifacts.roster)
+    if selection[0] is None:
+        return {"name": name, "available": False, "reason": selection[3]}
+    series, origin, split, rows = selection
+    # Exactly one value per model per configured alpha is what makes this a curve. The
+    # selection guarantees it; this check stops a later change from quietly drawing a second
+    # path's values under the same label.
+    for model_id in artifacts.roster:
+        cell = rows[rows["model_id"] == model_id]
+        if len(cell) != len(alphas) or cell["alpha"].nunique() != len(alphas):
+            return {
+                "name": name,
+                "available": False,
+                "reason": (
+                    f"origin {origin} on series {series} does not carry exactly one value per "
+                    f"configured alpha for {model_id}; plotting it would mix paths"
+                ),
+            }
     audit, _audit_path, _audit_note = _resolve_audit(artifacts.directory, artifacts.manifest)
     units = ((audit or {}).get("units") or {})
 
     fig, axis = plt.subplots(figsize=(7.2, 4.6))
-    for model_id in [name for name in artifacts.roster if name in set(rows["model_id"])]:
+    for model_id in artifacts.roster:
         cell = rows[rows["model_id"] == model_id].sort_values("alpha")
         axis.plot(cell["alpha"], cell["var"], marker="o", markersize=3.5, linewidth=1.1,
                   label=f"{model_id} VaR")
@@ -1596,7 +1636,7 @@ def _figure_curves(artifacts: RunArtifacts, plt) -> dict:
     axis.set_xlabel("alpha (lower-tail probability, log scale)")
     axis.set_ylabel("signed log return (negative = loss)")
     axis.set_title(
-        f"VaR/ES curves at origin {origin} ({split} split)", fontsize=10
+        f"VaR/ES curves at origin {origin} on {series} ({split} split)", fontsize=10
     )
     axis.grid(alpha=0.25, linewidth=0.5, which="both")
     axis.legend(fontsize=7, frameon=False, ncols=2)
@@ -1604,7 +1644,8 @@ def _figure_curves(artifacts: RunArtifacts, plt) -> dict:
     axis.set_xticklabels([f"{alpha:g}" for alpha in alphas])
     axis.text(
         0.99, 0.02,
-        f"units: {units.get('returns') or 'unavailable'}; one origin, descriptive only",
+        f"units: {units.get('returns') or 'unavailable'}; one origin on one series, "
+        "descriptive only",
         transform=axis.transAxes, ha="right", va="bottom", fontsize=7, color="0.35",
     )
     fig.tight_layout()
@@ -1616,8 +1657,9 @@ def _figure_curves(artifacts: RunArtifacts, plt) -> dict:
         "name": name,
         "available": True,
         "path": f"{PLOT_DIRECTORY}/{PLOT_CURVES}",
-        "caption": f"VaR and ES versus alpha at origin {origin} ({split} split) for all "
-        f"{len(artifacts.roster)} configured model(s); one origin, descriptive and not "
+        "caption": f"VaR and ES versus alpha at origin {origin} on series {series} "
+        f"({split} split) for all {len(artifacts.roster)} configured model(s), one value per "
+        "model per configured alpha; one origin on one series, descriptive and not "
         "representative of other dates",
     }
 
