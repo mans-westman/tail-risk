@@ -4,8 +4,16 @@ import warnings
 from typing import Any
 
 import numpy as np
-from arch.univariate import GARCH, StudentsT, ZeroMean
 from scipy.stats import t as student_t
+
+try:  # the fitting library is an optional extra, not a runtime requirement
+    from arch.univariate import GARCH, StudentsT, ZeroMean
+except ImportError as exc:  # pragma: no cover - exercised by the missing-extra check
+    raise ImportError(
+        "the GARCH-t model requires the `arch` package, which is not installed; install it "
+        "with `pip install 'tailrisk[baselines]'` (or `pip install arch`) and rerun. Runs "
+        "that do not configure `garch_student_t` do not need it."
+    ) from exc
 
 from tailrisk.conventions import validate_alpha_grid, validate_nu, validate_returns
 from tailrisk.features import FEATURE_WARMUP

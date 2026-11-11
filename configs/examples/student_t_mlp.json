@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "run_id": "example-student-t-mlp",
+  "dataset_id": "example_garch_student_t",
+  "dgp": {
+    "innovation": "student_t",
+    "omega": 5e-06,
+    "a": 0.05,
+    "b": 0.9,
+    "nu": 5,
+    "initial_variance": 0.0001,
+    "burn_in": 2000
+  },
+  "partitions": {
+    "train": 3000,
+    "validation": 1500
+  },
+  "seeds": {
+    "train": 6101,
+    "validation": 6102
+  },
+  "splits": [
+    "train",
+    "validation"
+  ],
+  "alpha_grid": [0.005, 0.01, 0.025, 0.05, 0.1, 0.2],
+  "historical_window": 1000,
+  "models": [
+    "historical_simulation",
+    "garch_student_t",
+    "joint_mlp"
+  ],
+  "mlp": {
+    "model_seed": 101,
+    "learning_rate": 0.001,
+    "batch_size": 256,
+    "max_grad_norm": 5.0,
+    "max_epochs": 100,
+    "patience": 10
+  },
+  "protocol": "Opt-in MLP example. Same data and splits as configs/examples/student_t.json, plus the joint MLP with the training settings recorded for the 2026-11-04 development experiment and no tuning. Requires the optional `neural` extra (jax, optax). Execution and reuse example, not performance evidence: no test partition is declared and the comparison to the baselines is not a ranking."
+}

@@ -1,94 +1,193 @@
-# Tailrisk — conditional tail-risk research toolkit
+# tailrisk — conditional tail-risk research toolkit
 
-A research toolkit for students and quantitative researchers comparing next-session value-at-risk (VaR) and expected shortfall (ES) models on one daily return series. It brings data timing, common-sample scoring, failure accounting and reproducibility evidence into one workflow. Synthetic cases supply known conditional risk; real data support forecast evaluation without an oracle. Returns are signed decimal log returns and `alpha` is a lower-tail probability; the supported scoring domain is `es <= var < 0`.
+A research toolkit for comparing next-session value-at-risk (VaR) and expected shortfall
+(ES) models on **one daily return series**. It supplies common timing, a common scoring
+sample, failure accounting, provenance and an inspectable report, so a comparison can be
+reproduced and audited instead of assembled in a notebook.
 
-**Maturity: working research prototype.** Historical simulation, a fitted GARCH–Student-t baseline and an alpha-conditioned joint MLP all produce forecasts, and the CLI can independently verify, score, and report them. All three models run on synthetic data and on an ingested real-data panel; the joint MLP has so far been run on the train/validation periods only (2016–2019 is development evidence, not a held-out result), its saved forecasts are replayed by `verify` from the checkpoint rather than refitted, and the available comparisons do not establish predictive superiority. Development status and dated evidence are kept in a local working log (`STATUS.md`), which is not distributed with the public package; this paragraph is the public-facing maturity statement and should stay short.
+Returns are signed decimal log returns and `alpha` is a lower-tail probability, so losses are
+negative and the supported scoring domain is `es <= var < 0`.
 
-## Approved delivery direction
+**Maturity: working research prototype.** Historical simulation, a fitted GARCH(1,1)-Student-t
+baseline and an optional alpha-conditioned joint MLP all produce forecasts, and the CLI
+verifies, scores and reports them independently. The MLP has so far been run on the
+train/validation periods only, so its saved forecasts are replay evidence, not a held-out
+result. No comparison in this repository establishes predictive superiority.
 
-The next milestone adds a documented returns-CSV input, a small public Python model-adapter interface, and a comparison report that separates artifact integrity, verification coverage and statistical results. Humans and a regular WorkSwarm skill will use the same CLI. These additions are **planned, not yet implemented**; current commands below remain the working entry points.
+## Install
 
-The [Stage 2 implementation roadmap](docs/STAGE2_IMPLEMENTATION.md) fixes the contracts and ordered acceptance gates. The toolkit does not certify absence of all leakage, regulatory suitability or universal model superiority. A novel constrained model is an optional later research extension, not a dependency of the reusable workflow.
-
-## Repository map
-
-```text
-tailrisk/                    # run commands here; Git root
-  README.md                  # this file: purpose, setup, commands, artifact meaning
-  docs/                      # approved implementation roadmap; public usage docs added by slice
-  configs/                   # JSON run and ingest configurations
-  src/tailrisk/              # package and CLI
-  tests/                     # numerical, timing, mask, and diagnostic checks
-  outputs/<run_id>/          # generated runs (ignored except its README)
-```
-
-Local working documents (`AGENTS.md`, `STATUS.md`, `DECISIONS.md`, `PROJECT_GUIDE.md`, and `LITERATURE_REVIEW.md`) are gitignored and are not required to follow this public quick start.
-
-## Setup
+Obtain the repository, then run every command on this page **from its root**:
 
 ```sh
+git clone https://github.com/mans-westman/tail-risk.git
+cd tail-risk
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[dev]'
+python -m pip install -e '.[baselines]'
 ```
 
-`pyproject.toml` declares numpy, scipy and pandas as runtime dependencies, pytest plus `arch` for development, and an optional `neural` extra for the alpha-conditioned MLP core. Install it with `python -m pip install -e '.[dev,neural]'` when running or developing the MLP: conventional-only CLI runs do not require JAX or Optax.
+The working directory matters. `configs/`, `docs/`, `examples/` and `skills/` live in the
+checkout, and the worked custom adapter is imported as `examples.custom_model.model`, which
+resolves only from the root. Commands are written `python -m tailrisk ...`; after
+`source .venv/bin/activate` the installed `tailrisk` script is equivalent for the synthetic and
+panel runs, but not for a run whose config names a factory from this checkout.
 
-The joint MLP is three layers: a mathematical core (`tailrisk.models.joint_mlp`: initialization, forward pass, FZ0 scores and their mean), a trainer (`tailrisk.models.joint_mlp_training`: train-only feature standardization, clipped-Adam fitting with validation-based checkpoint selection, original-unit prediction, NPZ+JSON inference checkpoint) and an adapter (`tailrisk.models.joint_mlp_model`) that builds the six causal features and per-origin return scale from one split's returns, reports unusable origins as explicit failed rows instead of dropping them, and turns the selected checkpoint into `forecast.csv` rows. The trainer consumes prepared arrays and decides no calendar cutoffs itself; the adapter receives only the origins the run's protocol permits. Installing the extra is required only when `models` includes `joint_mlp`. Dependency ranges are not a locked environment. Each run records its interpreter and dependency versions in `manifest.json`.
+`baselines` adds `arch`, which the GARCH-t model needs. Everything else is optional and
+genuinely so: without `neural` (JAX, Optax) the MLP is simply unavailable, without `plots`
+(Matplotlib) `report` still writes Markdown and JSON, and without `data` the exchange-calendar
+cross-check in `ingest` is recorded as skipped. Depth: [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
 
-## Commands
+## Quickstart, offline
 
 ```sh
-python -m pytest -q
-python -m tailrisk run      --config configs/smoke.json --output outputs/my-run
-python -m tailrisk run      --config configs/smoke_mlp.json --output outputs/my-mlp-run   # + joint MLP
+python -m tailrisk run      --config configs/examples/student_t.json --output outputs/my-run
 python -m tailrisk verify   --run outputs/my-run
 python -m tailrisk evaluate --run outputs/my-run
 python -m tailrisk report   --run outputs/my-run
-
-# real development: acquire once, then forecast train/validation only
-python -m tailrisk ingest   --config configs/sp500.json --out data/sp500
-python -m tailrisk run      --config configs/sp500_dev.json --output outputs/sp500-dev
-python -m tailrisk verify   --run outputs/sp500-dev
-python -m tailrisk evaluate --run outputs/sp500-dev
-python -m tailrisk report   --run outputs/sp500-dev
 ```
 
-`run` consumes either a declared synthetic DGP (`configs/smoke.json`) or an ingested panel (`configs/sp500_dev.json`, `data.kind: "returns_panel"`), builds causal features, and writes forecasts. A synthetic config declares `dgp`, `partitions` and `seeds`; a panel config declares `data.panel` instead, and supplying both is an error rather than a silent preference for one of them. `verify` re-derives the saved artifacts independently (including deterministic replay) and writes `artifact_verification.json`; it does not modify `checks.json`. `evaluate` scores the saved forecasts and writes `metrics.csv`. `report` assembles `report.md` from existing artifacts only.
+That simulates a GARCH(1,1) Student-t(5) series, forecasts it with historical simulation and
+GARCH-t, verifies the artifacts, scores them on a common mask, and renders a Markdown/JSON
+report. No network, no market data, and no test split is declared. Add `--plots` to the last
+command (plus `'.[plots]'`) for three PNGs. `configs/examples/gaussian.json` is the same
+experiment with Gaussian innovations; `configs/examples/student_t_mlp.json` adds the MLP.
 
-Use a new or empty output directory for every run. `run` refuses an existing file or nonempty directory before loading data or fitting models. Verification, evaluation and reporting explicitly update their own derived files within the selected run.
+Every example is an execution and reuse check with limited tail counts, not performance
+evidence. [examples/README.md](examples/README.md) walks through all of them, including a
+custom adapter on a locally generated CSV.
 
-`ingest` is the only command that touches the network; `run` never downloads, it reads the panel `ingest` wrote, so a run is reproducible from local files alone. It obtains one dated snapshot (`^GSPC` price-index closes by default), validates it, and writes `panel.csv` plus `data_audit.json`. Add `--from-raw` to re-derive from a saved payload without downloading, `--reference` to cross-check a return file whose units are declared (never inferred), and `--keep-raw` to store the payload, its SHA-256, and retrieval time. Market data is not redistributed: `data/` is ignored, so acquisition is reproducible from the config rather than from a committed cache.
+## Commands
 
-The panel is one causal table per split. Splits are assigned by **target date**, and validation/test keep trailing returns from the preceding period, so their opening sessions still have a full feature and historical window instead of being cropped. A split that cannot be given that context fails loudly. `is_scored` marks rows whose target lies in the split and whose origin has the required history; `prior_returns` and `origin_position` make the warm-up auditable, and `spans_long_gap` flags returns spanning a closure.
+| Command | Does | Writes |
+|---|---|---|
+| `run --config <json> --output <dir>` | simulates or reads the configured data, fits each model once, emits one forecast per model/origin/alpha | `forecasts.csv`, `failures.csv`, `oracle_curves.csv` (synthetic only), `manifest.json`, `config.resolved.json`, `checks.json`, `summary.md` |
+| `verify --run <dir>` | re-derives artifacts from the inputs; refits GARCH-t and replays the MLP checkpoint where applicable | `artifact_verification.json`, `verification_coverage.json` |
+| `evaluate --run <dir>` | scores saved forecasts on one common mask | `metrics.csv`, `score_decomposition.csv`, `paired_scores.csv`, `curve_diagnostics.csv` |
+| `report --run <dir> [--plots]` | renders saved artifacts only; no fit, no download | `report.md`, `report.json`, `plots/*.png` |
+| `ingest --config <json> --out <dir>` | the only command that touches the network: one dated snapshot, validated | `panel.csv`, `data_audit.json` |
 
-## Real-data protocol
-
-Development uses `configs/sp500_dev.json`, which executes train and validation only. The earlier conventional-model run already evaluated the 2020–2025 test period; it is an exposed retrospective comparison, not an untouched final holdout. Keep `configs/sp500_run.json` for explicitly planned full-period evaluation, not routine development.
-
-Panel runs require `train_end` and `validation_end` as `YYYY-MM-DD` strings, directly or through the ingestion audit. The resolved run configuration freezes both dates; verification uses those frozen dates and checks the consumed panel hash.
-
-A panel run is frozen rather than tuned: the split cutoffs, historical window, alphas and model set come from the config, and `run` refuses a panel that cannot supply every scored origin with a full trailing window. Every split carries its own causal context, so no opening session is discarded. Forecast rows carry real session dates instead of step indices, and only origins the panel marked `is_scored` are scored.
-
-Legacy development configs use 100 returns; at alpha <= 0.01 their empirical VaR and ES both equal the window minimum. The subsequent frozen 2026-11-04 comparison adopted W=1000 before running, on tail-resolution and sample-availability grounds. Its configs are in `configs/experiment-20261104/`. New Stage 2 examples will specify W=1000 explicitly; old configs and results are preserved, not silently changed.
-
-The GARCH-t likelihood is fitted exactly once, on the train split, and frozen for every split a run executes — validation always, test only in an explicitly requested full-period run; the parameters are recorded in `manifest.json`. `verify` proves this independently by refitting from the panel's train slice alone and replaying every saved forecast, and it names any dependency drift between the verifying interpreter and the run's manifest, since a refit is only comparable across matching numeric builds.
-
-A market-data run has no ground-truth oracle, so it writes no `oracle_curves.csv`, `verify` reports oracle comparisons as *not applicable* rather than passed, and `evaluate` leaves the oracle columns undefined. A stray oracle file in a real-data run fails verification. Because the cutoffs and the estimator were fixed before those partitions were scored, changing them later is a new specification, not a rerun.
+`run` refuses an existing file or nonempty output directory before loading data or fitting, so
+use a fresh path for each run. `verify`, `evaluate` and `report` update only their own derived
+files inside the chosen run.
 
 ## What the artifacts mean
 
-- `forecasts.csv` — one row per model, origin date, and alpha: `var`, `es`, `scale`, `realized_return`, `status`, in original return units.
-- `oracle_curves.csv` — evaluation-only synthetic truth (latent sigma and analytical oracle VaR/ES). Never a model input, and written only for synthetic runs: a real panel has no oracle at all.
-- `checkpoints/joint_mlp/` — written only when `joint_mlp` is configured: `checkpoint.json` (architecture, feature order, normalization, alpha grid, training log, selected epoch) and `arrays.npz` (parameters). `manifest.json` records the SHA-256 of both files plus the eligible row counts and selected epoch. `verify` loads this checkpoint, recomputes forecasts from the causal inputs and compares them with `forecasts.csv`; it never retrains, and a replaced or missing file fails verification. The smoke budget in `configs/smoke_mlp.json` is deliberately small: it is an execution check, not a trained result.
-- `failures.csv` — one row per failed forecast (`series_id, model_id, origin_date, target_date, alpha, scale, reason`), including runs with no failures (header only). Failed rows also stay in `forecasts.csv` with `status: "failed"` and no value, so the forecast schema is unchanged. `verify` requires the documented keys to match the failed rows one-to-one and recomputes each origin's six features to check that `ok` and `failed` are assigned exactly where the inputs allow, and that the stated reason is the one those features imply. Required only for `joint_mlp` runs. `verify` also derives the expected forecast keys per split, origin and alpha level from the permitted origins, the 63-return warm-up, the executed splits and the alpha grid, so a dropped origin, alpha level or whole split fails verification instead of shrinking the run silently.
-- `metrics.csv` — per split/model/alpha scores on a **common scoring mask**: within each (series, alpha) cell every model is scored on the same origins, so `n` is identical across models and means are comparable. `n_available`, `n_failed_rows` and `n_dropped_by_mask` expose the coverage cost; `n_invalid_output` counts non-finite predictions and violations of `es <= var < 0`, which are flagged rather than clipped. A model that fails outright empties its cell (all models report `n = 0`) instead of letting the survivors be scored alone, and a model listed in the resolved config that wrote no rows at all fails `evaluate` rather than shrinking the comparison. Scoring also rejects duplicate `(series, model, alpha, origin)` keys and target dates that do not follow their origins. Backtests are Kupiec (unconditional coverage) and Christoffersen (independence); `nan` means the statistic was undefined (for example no exceedances at all) and is reported as undefined rather than imputed. `n_transitions` and `n_chain_breaks` record how many chronologically adjacent pairs entered the independence test and how many were severed by a scoring-mask or session gap, so a broken chain is visible instead of silently joining non-adjacent days.
-- `checks.json` — offline mathematical checks; `manifest.json` / `config.resolved.json` — provenance; `summary.md`, `report.md` — readable outputs.
+- **`forecasts.csv`** — one row per model, origin and alpha: `var`, `es`, `scale`,
+  `realized_return`, `status`, in original return units.
+- **`failures.csv`** — one row per **affected key**, covering two different cases with exactly
+  one explanation each: an explicit model failure (`status: "failed"`, no value) and an
+  invalid output — a finite-shaped answer that is non-finite or violates `es <= var < 0` and
+  therefore stays in `forecasts.csv` for the scorer to count. Failed rows keep their place in
+  `forecasts.csv` with no value; nothing is imputed. The provenance of the reason differs by
+  case: an explicit failure carries the **model's own declared** reason, which for a custom
+  adapter is author-reported and not independently established, while an invalid output
+  carries the runner's recomputed vocabulary (`non_finite_output`, `outside_supported_domain`)
+  that `verify` recomputes and demands an exact match. For the built-in MLP, `verify`
+  additionally rebuilds the six features at each origin to check that `ok` and `failed` were
+  assigned where the inputs allow.
+- **`metrics.csv`** — per split/model/alpha scores on a **common mask**: within each
+  `(series, alpha)` cell every model is scored on the same origins, so `n` is identical and
+  means are comparable. `n_available`, `n_failed_rows`, `n_dropped_by_mask` and
+  `n_invalid_output` expose the coverage cost. Backtests are Kupiec and Christoffersen; `nan`
+  means undefined, not zero.
+- **`score_decomposition.csv`**, **`paired_scores.csv`**, **`curve_diagnostics.csv`** — the
+  additive parts of the loss, paired mean differences on the same mask, and within-alpha
+  admissibility plus adjacent-alpha crossings. Semantics in [docs/REPORTING.md](docs/REPORTING.md).
+- **`artifact_verification.json`**, **`verification_coverage.json`** — every integrity check
+  with `passed`/`failed`/`unavailable`/`not_applicable` and a reason. Unavailable replay is
+  partial coverage, never a pass.
+- **`manifest.json`, `config.resolved.json`, `checks.json`** — provenance: frozen
+  configuration, interpreter and dependency versions, fitted parameters, model capabilities,
+  factory hashes, and the offline mathematical checks.
 
-Synthetic-only runs are execution checks, not statistical evidence. Oracle comparisons are implementation checks, not forecasting skill. A failed row (`status: "failed"`) carries a real origin and target, an explicit reason in `failures.csv` (checked by `verify` against the rebuilt features) and no forecast value: it is counted in `n_failed_rows` and never imputed, so coverage loss stays visible instead of shrinking the sample quietly.
+## Bring your own data
 
-## Reuse and limits
+An ingestion config can read a **declared local returns CSV** (`session_date,return`, ISO
+dates, decimal log returns, ascending and unique) instead of downloading. Local CSV ingestion
+is entirely **offline**; only the provider path — `ingest` against a market-data source such as
+`configs/sp500.json` — uses the network, and it is the only command in the toolkit that does.
+Nothing is sorted, inferred or repaired: an unresolved gap stops ingestion. The audit records
+the source hash and the declared cutoffs, and a run then reads only local files. Contract:
+[docs/DATA_CONTRACT.md](docs/DATA_CONTRACT.md).
 
-This is a course project intended to become a reusable [openJiuwen WorkSwarm](https://github.com/openJiuwen-ai/jiuwenswarm) workflow; fresh-run skill evidence is not yet collected. Substantial AI assistance has been used for planning and implementation; reviewed code and saved execution evidence determine what is established.
+A real panel run needs `train_end` and `validation_end`; the resolved run freezes them, and
+`verify` re-checks the consumed panel hash. `configs/sp500_dev.json` executes train and
+validation only. The 2020–2025 test period of the earlier conventional-model run is already an
+exposed retrospective comparison, not an untouched holdout, so `configs/sp500_run.json` is for
+explicitly planned full-period evaluation rather than routine development. Market data is not
+redistributed: `data/` is ignored and `ingest` re-acquires from the config.
 
-No project license has been selected yet, and third-party attribution must be resolved before public release. Neither these forecasts nor this prototype establish suitability for trading or regulatory use.
+## Bring your own model
+
+A model is a small Python adapter — `fit`, `predict_one`, `summary`, plus a declared
+`ModelSpec` — named in the configuration as `module:function`. The runner owns IDs, targets and
+realized returns, and every prediction argument contains a **bounded causal prefix**: a history
+array that ends at the origin, owns its memory, and carries no target, oracle, latent
+volatility path or later row. Checkpoints are optional and replayed by `verify` with `fit`
+disabled. No evaluator edit is needed to register a model.
+
+That boundary is what the toolkit hands over, not a sandbox. A factory is arbitrary Python
+executing in your process: imported code can still read files, reach the network or hold
+pretrained state, and the manifest records its declarations plus a hash of the imported module
+rather than proving their absence. There is **no universal leakage guarantee**, and the
+verification checks listed in [docs/METHODS.md](docs/METHODS.md) are the ones that ran.
+
+Contract and worked example: [docs/MODEL_ADAPTER.md](docs/MODEL_ADAPTER.md).
+`examples/bring_your_model/` holds a standalone EWMA–Gaussian forecast that is deliberately
+*not* registered or integrated — the raw function a researcher adapts through that contract.
+
+## Optional extras
+
+| Extra | Adds | Needed for |
+|---|---|---|
+| `baselines` | `arch` | `garch_student_t` |
+| `neural` | `jax`, `optax` | `joint_mlp` (also needs `JAX_ENABLE_X64=1`) |
+| `plots` | `matplotlib` | `report --plots` |
+| `data` | `pandas_market_calendars` | the optional exchange-session cross-check in `ingest` |
+| `dev` | `pytest`, `arch` | the test suite |
+
+## WorkSwarm skill
+
+`skills/tail-risk-audit/` is a regular [openJiuwen WorkSwarm](https://github.com/openJiuwen-ai/jiuwenswarm)
+skill: one CLI workflow (inspect inputs → resolve config → run → verify → evaluate → report →
+explain evidence and failures) with the public pages copied under `references/` so a copied
+skill does not depend on this checkout. It runs the same commands as a human; no model is called
+inside the numerical execution, and `skills/tail-risk-audit/check_references.py` keeps the
+copies in step with `docs/`.
+
+To install it, copy the directory into the workspace skills root and start a new session so the
+runtime rescans that directory:
+
+```sh
+cp -R skills/tail-risk-audit ~/.jiuwenswarm/agent/workspace/skills/
+# then start a new WorkSwarm session and ask it to run a tail-risk audit
+```
+
+The engine still has to be installed where that session runs (`python -m pip install -e
+'.[baselines]'`, or the package plus its extras); the skill does not vendor the code.
+
+**Where the evidence stops.** The package passes the runtime's own skill validator, and its
+scanner and inventory code parse it into a registered skill with a name, description and content
+hash. What has **not** been observed is live installation followed by a session reload, and a
+fresh agent executing the workflow in a new conversation. Those are the remaining gate, so the
+current claim is "loadable, and the workflow is documented and tested by hand" — not "a fresh
+agent has run it".
+
+## What this does not establish
+
+- No leakage certificate. The verification checks are the ones listed in
+  [docs/METHODS.md](docs/METHODS.md); trusted local plugin code is not sandboxed, and no check
+  detects contaminated pretraining or researcher selection.
+- No ranking, significance or suitability claim: comparisons are whole-method, differences
+  carry no confidence interval, and repeated seeds on one series are not independent evidence.
+- No ES-specific backtest and no bootstrap inference; both are unavailable, not passed.
+- Synthetic runs are implementation and execution checks, not evidence about markets.
+
+## Licence
+
+No project licence has been selected. Choosing one is a prerequisite for publication and is
+deliberately left to the project owner; attribution for methods and dependencies is in
+[docs/METHODS.md](docs/METHODS.md).
+
+Substantial AI assistance was used for planning and implementation. Reviewed code and saved
+execution evidence, not the assistance, determine what is established.

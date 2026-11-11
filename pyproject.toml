@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tailrisk"
 version = "0.1.0"
-description = "Deterministic foundation for conditional tail-risk forecasting"
+description = "Research toolkit for comparing conditional VaR/ES forecasts on one daily return series"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=2.0",
@@ -14,6 +14,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Optional: the `garch_student_t` baseline, fitted with arch's GARCH(1,1)-Student-t. Importing
+# the package, running historical simulation and running a custom adapter all work without
+# it; a config that lists `garch_student_t` fails with an install hint, not a bare
+# ModuleNotFoundError.
+baselines = ["arch>=8"]
 dev = ["pytest>=8", "arch>=8"]
 # Optional: exchange-session cross-check for the market-data adapter. `ingest` runs
 # without it and records the check as skipped rather than guessing a calendar.

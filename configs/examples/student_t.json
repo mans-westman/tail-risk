@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "run_id": "example-student-t",
+  "dataset_id": "example_garch_student_t",
+  "dgp": {
+    "innovation": "student_t",
+    "omega": 5e-06,
+    "a": 0.05,
+    "b": 0.9,
+    "nu": 5,
+    "initial_variance": 0.0001,
+    "burn_in": 2000
+  },
+  "partitions": {
+    "train": 3000,
+    "validation": 1500
+  },
+  "seeds": {
+    "train": 6101,
+    "validation": 6102
+  },
+  "splits": [
+    "train",
+    "validation"
+  ],
+  "alpha_grid": [0.005, 0.01, 0.025, 0.05, 0.1, 0.2],
+  "historical_window": 1000,
+  "models": [
+    "historical_simulation",
+    "garch_student_t"
+  ],
+  "protocol": "Execution and reuse example, not performance evidence. GARCH(1,1)-Student-t with the toolkit's existing parameters (omega 5e-06, a 0.05, b 0.9, nu 5, initial variance 0.0001, burn-in 2000), 3000 train and 1500 validation returns, W=1000, the six configured alpha levels, and the two conventional baselines. Test is not declared, so no held-out observation is simulated, fitted or scored. Validation leaves about 500 scored origins per level; at alpha 0.005 the expected exceedance count is about 2, so coverage and Kupiec/Christoffersen output are sparse and are reported as execution diagnostics only."
+}

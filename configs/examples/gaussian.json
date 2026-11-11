@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "run_id": "example-gaussian",
+  "dataset_id": "example_garch_gaussian",
+  "dgp": {
+    "innovation": "gaussian",
+    "omega": 5e-06,
+    "a": 0.05,
+    "b": 0.9,
+    "initial_variance": 0.0001,
+    "burn_in": 2000
+  },
+  "partitions": {
+    "train": 3000,
+    "validation": 1500
+  },
+  "seeds": {
+    "train": 6201,
+    "validation": 6202
+  },
+  "splits": [
+    "train",
+    "validation"
+  ],
+  "alpha_grid": [0.005, 0.01, 0.025, 0.05, 0.1, 0.2],
+  "historical_window": 1000,
+  "models": [
+    "historical_simulation",
+    "garch_student_t"
+  ],
+  "protocol": "Execution and reuse example, not performance evidence. GARCH(1,1) with Gaussian innovations and the toolkit's existing parameters (omega 5e-06, a 0.05, b 0.9, initial variance 0.0001, burn-in 2000), 3000 train and 1500 validation returns, W=1000, the six configured alpha levels, and the two conventional baselines. Test is not declared, so no held-out observation is simulated, fitted or scored. The Gaussian case is the misspecified counterpart to configs/examples/student_t.json: the same estimators face a data-generating process whose tails are thinner than the fitted GARCH-t assumes, which is a legitimate outcome to observe rather than a failure of the toolkit."
+}
