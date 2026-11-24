@@ -1,29 +1,44 @@
 # Local run artifacts
 
-Generated runs are ignored by Git. `run` refuses a nonempty output directory, so every run needs a fresh path; `verify`, `evaluate` and `report` intentionally overwrite only their own derived artifacts (`artifact_verification.json`, `metrics.csv`, `report.md`).
+Generated runs are ignored by Git. Nothing here is part of the release: a clone contains code,
+documentation, examples and the curated trial record under `../evidence/stage2/s26/`, not run
+outputs. Runs you create stay on your machine.
 
-## Current evidence
+`run` refuses a nonempty output directory, so every run needs a fresh path; `verify`,
+`evaluate` and `report` intentionally overwrite only their own derived artifacts
+(`artifact_verification.json`, `metrics.csv`, `report.md`).
 
-- `exp-20261104-diagnostic/` — **decomposition of the real validation deficit at alpha = 0.005 and 0.010**, produced by `scripts/diagnose_fz0.py` from the nine runs' saved tables (no refit, no new seed, nothing dropped). `decomposition.md` is the readable form; `row_scores.csv` carries per-row FZ0 and its three additive terms, `date_contributions.csv` per-date differences against both baselines, `gap_summary.csv` the concentration statistics, `level_summary.csv` mean VaR/ES and exceedances by alpha, `top_date_recurrence.csv` the dates that recur across seeds. Its recomputed means reproduce `metrics.csv::mean_fz0` to 8.9e-16 on all 18 cells. Written up in `../DIAGNOSTIC_20261104_fz0_decomposition.md`.
-- `exp-20261104-summary/` — **the reference for the 2026-11-04 development comparison** (W = 1000, validation split only). Aggregated from the nine run directories below: coverage per model and alpha cell, mean FZ0 by alpha with the best value per column, per-seed detail and seed standard deviations, differences versus historical simulation and GARCH-t, 0.025 coverage diagnostics, synthetic oracle errors, fit facts and the interpretation limits. Read `summary.md` first; the four CSVs are its machine-readable form.
-- `exp-20261104-{syng,synt,real}-s{101,102,103}/` — the nine runs behind that summary: Gaussian synthetic (`syng`), Student-t synthetic (`synt`) and the real panel (`real`), three model seeds each. Synthetic: 238,476 forecast rows, `oracle_curves.csv` present, **25/25** applicable artifact checks. Real: 118,026 rows, no oracle by design, **23/23** applicable checks with 1 not applicable. Every run replays the joint-MLP checkpoint from rebuilt causal inputs (0 mismatches over 83,244 synthetic / 39,342 real MLP rows), has 0 failed rows, 0 invalid outputs and no `es <= var < 0` violation. Protocol: `../EXPERIMENT_PROTOCOL_20261104.md`; the numbers are development evidence on validation data the MLP checkpoint was also selected on, and the 2020–2025 test period was not simulated.
-- `mlp-smoke-20261103-v2/` — the same synthetic configuration re-run after the completeness and failure-reason repair: 5,916 forecasts, 32/32 offline checks, **25/25 applicable artifact checks** (the previous 22 plus `mlp_forecast_keys_complete`, `failure_rows_documented`, `failed_rows_match_rebuilt_features`), 36 metric rows, `failures.csv` header-only (every requested origin usable). Supersedes `mlp-smoke-20261103/` for verification evidence; that run is preserved unchanged.
-- `mlp-smoke-20261103/` — synthetic three-model execution check that includes the **first joint-MLP run**: 5,916 forecasts (1,668 historical + 2,124 GARCH-t + 2,124 joint MLP), 32/32 offline checks, 22/22 applicable artifact checks, 36 metric rows, `splits: ["train", "validation"]` so the declared test partition is never simulated. The MLP was fitted for 4 epochs by construction and its checkpoint (schema 2, float64) is replayed by `verify` from the causal inputs with 0 mismatches out of 2,124 rows; `checkpoints/joint_mlp/` holds `checkpoint.json` and `arrays.npz`, both hashed in `manifest.json`. Scores here are execution evidence, not calibration or comparison evidence.
-- `hygiene-smoke-20261103/` — synthetic execution check under the current verifier: 7,848 forecasts, 32/32 offline checks, 19/19 artifact checks, replay 0 mismatches, 36 metric rows. Bit-identical to `repair-smoke-20261103` (maximum numeric delta 0.0 in both forecasts and metrics), so it documents that the 2026-11-03 hygiene pass moved no number.
-- `sp500-dev-20261103-v2/` — **canonical development run** (`^GSPC`): `splits: ["train", "validation"]`, so the 2020–2025 test period is never forecast or scored. 89,484 forecasts (44,742 historical + 44,742 GARCH-t), 24 metric rows, panel SHA-256 `75301d1f144921de…`, 18/18 applicable checks passed with 1 not applicable (no oracle exists for market data). Use this for every model-development comparison.
-- `sp500-dev-20261103/` — the same specification repeated minutes earlier, byte-identical configuration and panel hash. Kept as a run-guard artifact; cite `-v2` to avoid ambiguity.
+## What ships instead
 
-## Exposure and verifiability of the real-data run
+- [`../evidence/stage2/s26/`](../evidence/stage2/s26/03_RESULTS.md) — the fresh-agent WorkSwarm
+  trial: exact commands, exit codes, runtimes, results, figures, and the post-trial reporting
+  repair with superseded figures labelled.
+- [`../docs/ENVIRONMENT.md`](../docs/ENVIRONMENT.md) — tested environments and measured runtimes.
+- [`../docs/METHODS.md`](../docs/METHODS.md) — what the numbers do and do not establish.
 
-- `sp500-real-20261102/` — first real-data run (`^GSPC`, raw snapshot SHA-256 `8d599cd575e1602cbc82dcd6b31f4727aee0d389fc9ddb2cc186621c39580a1d`, retrieved 2026-11-02T10:28:55Z). Full-period protocol: cutoffs fixed in review (train ≤ 2015-12-31, validation 2016–2019, test 2020–2025), 100-session window, six alphas, two models, GARCH-t fitted once on train only. 8,965 scored origins → 107,580 forecast rows; 34/34 offline checks; 36 metric rows; `nan` oracle columns by design. **The test period has been scored and its Kupiec/Christoffersen metrics inspected** — it is an exposed retrospective, not an untouched holdout, and no superiority claim attaches to it.
-- Its manifest carries no `panel_sha256` and its resolved config carries no `cutoffs`, because both guarantees postdate it. The current `verify` replays all 107,580 rows from the boundary the ingestion audit declares, reports 0 mismatches, and still exits 1 on exactly `panel_sha256_matches` and `effective_cutoffs_frozen`. Read that as *cannot prove which panel it consumed*, not *numbers wrong*; the run's saved `artifact_verification.json` (15/15 at creation) is the evidence of record. Do not patch the manifest to silence this.
-- Replay is only comparable under the dependencies a run was produced with: this run (numpy 2.5.3, pandas 3.0.5) reproduces exactly there, while numpy 2.5.4/pandas 3.1.0 shifts the fitted GARCH parameters in the 6th–7th digit and reports 53,790/53,790 GARCH mismatches. `verify` names such drift in its replay detail so it is not misread as data corruption. Fresh real-data evaluation requires separate authorization and a new run directory.
+## Development run record (local, not distributed)
 
-## Superseded or historical
+The 2026-10-31 … 2026-11-04 development runs — synthetic smoke runs, the nine-run comparison,
+the S&P 500 development runs and the first real-data run — live only in this working copy.
+Their per-directory inventory is therefore a local record, not a reader-facing page. Two facts
+from it are worth carrying in public, because they limit what any old number can be cited for:
 
-- `mask-smoke-20261102/` — same forecasts and mask as `repair-smoke`, but its Christoffersen columns were computed with the pre-repair pooled probability (`(n01+n11)/n`) and without chain-break handling. Its FZ0, quantile loss and Kupiec values were unaffected; cite a later synthetic run for any diagnostic.
-- `consolidation-smoke-20261102/` — identical forecasts, but its `metrics.csv` predates the common scoring mask, so its per-model `n` and mean scores are not comparable across models.
-- `repair-smoke-20261102/` and `repair-smoke-20261103/` — synthetic runs under the repaired evaluator; the 2026-11-03 one is the reference point for the neutrality comparison above. Both still verify.
-- `smoke/`, `relocation-smoke-20261031/`, `verify-repair-20261031/` — single-model, pre-consolidation runs kept as historical evidence. `smoke/` also predates the 2026-10-31 forecast-timing repair, which is why its replay now fails; it must not be used for evaluation.
+- **The real-data run is an exposed retrospective.** Its 2020–2025 test period has been scored
+  and its Kupiec/Christoffersen metrics inspected, so it is not an untouched holdout and no
+  superiority claim attaches to it. Its manifest also predates panel hashing and frozen cutoffs;
+  the current `verify` replays every row with 0 mismatches and still exits 1 on exactly
+  `panel_sha256_matches` and `effective_cutoffs_frozen`. Read that as *cannot prove which panel
+  it consumed*, not *numbers wrong*, and do not patch the manifest to silence it.
+- **Replay is dependency-bound.** A run reproduces under the versions that produced it; a
+  numpy/pandas shift moved the fitted GARCH parameters in the sixth to seventh digit and turned
+  every GARCH row into a replay mismatch. `verify` names such drift, so it is not misread as
+  data corruption.
 
-Synthetic runs are execution checks, not statistical evidence; the real run is descriptive evidence for one index, not a forecasting claim. Historical manifests and forecast files are never edited to make an old output look current — a corrected specification is a new run. Market data itself is never stored here: only derived artifacts, and `data/` stays ignored.
+## Policy for any run directory kept here
+
+- **A corrected specification is a new run.** Historical manifests and forecast files are never
+  edited to make an old output look current.
+- **Real market data is never stored here.** Only derived artifacts, and `data/` stays ignored;
+  the provider's terms apply to the feed, not to this repository.
+- **Exposure is recorded, not hidden.** A run whose test period was scored is labelled as an
+  exposed retrospective, not an untouched holdout.

@@ -12,10 +12,9 @@ numerical execution, and you never edit a run's artifacts by hand.
 ## Preconditions
 
 **Interpreter.** Use the project's own environment, `.venv/bin/python` at the repository root, or
-another interpreter that already has the package. A bare `python3` on this machine is an old
-system interpreter without NumPy, and every command below fails there. Confirm before starting:
-`.venv/bin/python -m tailrisk --help` must print usage. Throughout this skill, `python` means that
-interpreter.
+another interpreter that already has the package installed. Do not assume a bare `python3` has
+`tailrisk` or NumPy available. Confirm before starting: `python -m tailrisk --help` must print
+usage. Throughout this skill, `python` means that interpreter.
 
 **Extras.** The quickstart needs `baselines` (`arch`); add `plots` for figures, and `neural` (plus
 `JAX_ENABLE_X64=1`) only for the joint MLP:

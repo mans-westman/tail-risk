@@ -36,8 +36,9 @@ Manifest: `module_sha256=dc99ba8410c15ed1…`, checkpoint
 `sha256=8d8bd6860a525b8d…`).
 
 **Baseline invariance.** The 24 metric rows for the two baselines are identical between the two
-runs (`pandas.DataFrame.equals` → `True`). Adding the adapter changed neither the simulated
-data nor the baseline forecasts or scores.
+runs (`pandas.DataFrame.equals` → `True`). That is equality of the parsed rows, not a byte-level
+comparison of the two `metrics.csv` files; the claim is limited accordingly. Adding the adapter
+changed neither the simulated data nor the baseline forecasts or scores.
 
 ## 2. Matched sample counts and exclusions
 

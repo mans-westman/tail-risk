@@ -1,7 +1,7 @@
 # Examples
 
-Three runnable cases and one worked custom adapter. All of them are offline: nothing here
-downloads data, and no market snapshot is bundled.
+Five runnable cases and one standalone researcher-supplied model. All of them are offline:
+nothing here downloads data, and no market snapshot is bundled.
 
 Each example is an **execution and reuse check**. The synthetic ones have a known
 data-generating process, which makes their oracle columns an implementation check, and a few
@@ -101,9 +101,31 @@ python examples/bring_your_model/ewma_gaussian.py   # numerical self-check, prin
 ```
 
 See [bring_your_model/README.md](bring_your_model/README.md) for the interface, the fixed
-mathematics, the validation rules and what it deliberately leaves out. It is intentionally not
-registered, not run and not compared here; that is the integration step described in
-[the adapter contract](../docs/MODEL_ADAPTER.md).
+mathematics, the validation rules and what it deliberately leaves out.
+
+## 6. The integration built from it
+
+`ewma_gaussian_adapter/model.py` is that contract filled in for the supplied function and
+nothing else: `predict_one` calls `bring_your_model.ewma_gaussian.forecast` with the causal
+history the runner hands over and maps its three return values onto `Forecast` records. The
+supplied file is imported, not copied or edited. `decay` and `warmup` are settings, so `fit`
+estimates no parameter and the checkpoint is a small JSON file.
+
+```sh
+python -m tailrisk run      --config configs/examples/gaussian_ewma.json --output outputs/example-gaussian-ewma
+python -m tailrisk verify   --run outputs/example-gaussian-ewma
+python -m tailrisk evaluate --run outputs/example-gaussian-ewma
+python -m tailrisk report   --run outputs/example-gaussian-ewma --plots
+```
+
+The config is the Gaussian example plus `example_ewma_gaussian`, so the two baselines and the
+data are unchanged and their scores can be compared with case 2. As in case 4, use
+`python -m tailrisk` from the repository root: the factory is
+`examples.ewma_gaussian_adapter.model:create_model`. Expect 67,476 forecast rows, 33/33
+applicable verification checks and an adapter replay of 26,244/26,244.
+
+This is the case a fresh WorkSwarm agent executed in the S2.6 trial, and its results, figures and
+limitations are recorded in [the trial evidence](../evidence/stage2/s26/03_RESULTS.md).
 
 ## Where the rest of the documentation is
 
