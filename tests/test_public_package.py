@@ -27,11 +27,17 @@ DOCS_DIR = REPO_ROOT / "docs"
 
 #: Markdown that ships to a reader. Private planning files are deliberately absent.
 PUBLIC_MARKDOWN = (
-    REPO_ROOT / "README.md",
-    REPO_ROOT / "examples" / "README.md",
-    REPO_ROOT / "examples" / "bring_your_model" / "README.md",
-    SKILL_DIR / "SKILL.md",
-) + tuple(sorted(DOCS_DIR.glob("*.md")))
+    (
+        REPO_ROOT / "README.md",
+        REPO_ROOT / "examples" / "README.md",
+        REPO_ROOT / "examples" / "bring_your_model" / "README.md",
+        REPO_ROOT / "demo" / "README.md",
+        REPO_ROOT / "outputs" / "README.md",
+        SKILL_DIR / "SKILL.md",
+    )
+    + tuple(sorted(DOCS_DIR.glob("*.md")))
+    + tuple(sorted((SKILL_DIR / "references").glob("*.md")))
+)
 
 #: The researcher-facing standalone model must stay independent of the toolkit.
 STANDALONE_MODEL = REPO_ROOT / "examples" / "bring_your_model" / "ewma_gaussian.py"
