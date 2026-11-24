@@ -26,8 +26,9 @@ Outputs: `row_scores.csv` (per row: FZ0 and its three terms), `date_contribution
 
 ## 1. Corrections to the assessment delivered with the experiment
 
-Five statements were too strong or wrong. Each is corrected here; the underlying numbers are
-unchanged.
+Eight statements were too strong or wrong: five in the experiment write-up (1.1–1.5) and three
+in this document's own first draft (1.6). Each is corrected here; the underlying numbers are
+unchanged and nothing was rerun.
 
 **1.1 "Well calibrated" — withdrawn.** The accurate statement is: *the reported tests did not
 reject calibration at alpha = 0.025 on this validation sample* — 25 exceedances against 25.15
@@ -66,6 +67,20 @@ computed and inspected, as recorded in STATUS.md and `outputs/README.md`. What i
 narrower: no joint-MLP forecast exists for any test session, and this experiment computed
 none. The `exposure` string frozen into the ingest configs and run manifests predates that
 history and understates it; it is not the exposure record.
+
+**1.6 Three further corrections of this document's own first draft (second review,
+2026-11-04).** (a) The MLP's mean alpha = 0.005 VaR (−0.0225) is *shallower* than both
+baselines (−0.0235 GARCH–t, −0.0292 historical). The first draft called it "between" the
+baselines, which is arithmetically wrong: a smaller magnitude in a signed loss scale is a
+shallower forecast, not an intermediate one. (b) "Tail-shape failure, not level failure" is
+withdrawn. The results suggest insufficient separation across alpha levels *and* poor
+adaptation to market conditions; average curves cannot isolate either, so §4 states both as
+candidates and claims neither. (c) The decomposition does **not** exonerate the ES head. ES is
+the denominator of the shortfall penalty as well as the argument of `log(-e)`, so a smaller
+|ES| lowers one term while inflating the other; the three terms are coupled algebraic
+contributions of a single scoring rule, not independent head-specific diagnoses (§3.4).
+Relatedly, adding the seeds together gives predictions on the **same dates** — three
+repetitions of one market sample, not three samples — so per-seed counts stay primary (§3.2).
 
 Everything else in the earlier assessment stands: the MLP beats historical simulation at
 alpha = 0.025 in all three cases, trails GARCH–t in all three, and is last on the real
@@ -115,37 +130,49 @@ Mean signed VaR/ES, decimal log returns. Conventional models are seed-invariant.
 | MLP | 0.010 | −0.02005 / −0.01985 / −0.02077 | −0.02529 / −0.02458 / −0.02540 | 17 / 20 / 20 | 10.06 | 0.045 / 0.0055 / 0.0055 |
 | MLP | 0.200 | −0.00883 / −0.00870 / −0.00819 | −0.01149 / −0.01158 / −0.01120 | 97 / 96 / 109 | 201.20 | 4.1e-19 / 1.7e-19 / 5.8e-15 |
 
-Two features stand out, and they point in opposite directions:
+Two features stand out:
 
-- **In level, the MLP's alpha = 0.005 VaR is not obviously too shallow.** Its mean
-  (−0.0225) sits between GARCH–t (−0.0235) and historical simulation (−0.0292), yet it
-  produces 14–18 exceedances against 4 and 9. The problem is *where* the shallow values
-  fall, not the average depth.
+- **The average VaR is shallower than either baseline.** The MLP's mean alpha = 0.005 VaR is
+  −0.0225, i.e. *less negative* than GARCH–t (−0.0235) and historical simulation (−0.0292),
+  and it produces 14–18 exceedances against 4 and 9. Its average forecast in that tail is
+  therefore the shallowest of the three. An average cannot say whether the exceedances come
+  from a uniformly shallow curve or from shallow values on particular days; Section 3.3 shows
+  the second pattern, but the average itself is simply shallower and must not be described as
+  sitting between the baselines.
 - **The alpha curve is compressed.** Mean |VaR| from alpha = 0.005 to 0.200 falls by a factor
   of 2.63 for the MLP, 3.89 for GARCH–t and 6.88 for historical simulation; from 0.025 to
-  0.005 the MLP deepens by only 1.35x against 1.48x and 1.58x. The network separates the four
-  larger levels well and compresses the extreme one.
+  0.005 the MLP deepens by only 1.35x against 1.48x and 1.58x. That is a description of how
+  the MLP separates neighbouring alpha levels. It is not an explanation of why the separation
+  is insufficient.
 
 ### 3.2 Exceedance structure at alpha = 0.005
 
-Pooled over the three seeds (3 × 1,006 date-observations):
+Per-seed counts are the primary figures: the MLP exceeds **14 / 16 / 18** times for seeds
+101 / 102 / 103, GARCH–t 9, historical simulation 4, against 5.03 expected. The table below
+adds the same 1,006 dates together across the three seeds — 3,018 predictions on **three
+repetitions of one market sample**, not three independent samples. The totals describe how the
+failure is distributed across seeds; they are not a larger evidence base, and the local
+variability of a 5-exceedance statistic is not estimated by any of this.
 
-| comparison | MLP exceedances | baseline exceedances | both | MLP only | baseline only |
+| comparison | MLP predictions exceeded | baseline predictions exceeded | both | MLP only | baseline only |
 |---|---|---|---|---|---|
 | vs historical | 48 | 12 | 12 | 36 | 0 |
 | vs GARCH-t | 48 | 27 | 27 | 21 | 0 |
 
-Every historical-simulation exceedance is also an MLP exceedance; the MLP adds 36. Of its 48
-exceedances, 7 are days whose realised return is smaller than 1.5% in absolute value
+Every historical-simulation exceedance is also an MLP exceedance; across the three seeds the
+MLP adds 36 exceeded predictions on the same dates. Of its 48 exceeded predictions, 7 are days
+whose realised return is smaller than 1.5% in absolute value
 (2017-03-02 −0.59%, 2017-06-20 −0.67%, 2018-01-29 −0.68%, 2018-01-30 −1.06%, …) where the
 MLP's own VaR had fallen to −0.47% to −1.0%. The opposite failure appears on stressed days:
 on 2016-06-24 the realised return was −3.66%, historical simulation said −2.53%, GARCH–t said
 −1.96%, and the MLP said −1.16%.
 
-So the same defect produces both: at alpha = 0.005 the conditional curve is too tight when
-volatility is low and still too shallow when it is high. Both are failures of tail *shape*
-across the conditioning, not a uniform level shift, which is why a single mean VaR comparison
-looks acceptable.
+Two error directions are visible at alpha = 0.005: too tight when volatility is low (the
+calm-day cases above) and still too shallow when it is high (2016-06-24 and the other stress
+dates). That is consistent with poor adaptation to market conditions, and it is also
+consistent with insufficient separation across alpha levels; the same dates cannot choose
+between the two. Note that the average VaR is shallower than both baselines, so the mean is not
+"acceptable" either — it is simply a summary that hides which dates carry the error.
 
 ### 3.3 Contribution of individual dates (per seed, per baseline)
 
@@ -187,11 +214,24 @@ Aggregate difference per term (sums to the mean difference; means over 1,006 dat
 | 103 | 0.005 | historical | **+1.1078** | −0.0082 | −0.3350 | +0.7647 |
 | 103 | 0.005 | GARCH-t | **+0.5262** | +0.0137 | −0.0820 | +0.4579 |
 
-The shortfall term carries the whole deficit and more; the log(−ES) term *favours* the MLP
-because its ES is narrower (|ES| ≈ 0.0279 against 0.0350 for historical simulation), and the
-ratio term is negligible. The MLP is penalised for missing VaR exceedances, not for a
-mis-scaled ES, and its narrower ES partially offsets the penalty — which is a property of
-this loss, not a defence of the forecast.
+The shortfall term carries the whole deficit and more; the log(−ES) term is negative, i.e.
+favours the MLP, because its ES is narrower (|ES| ≈ 0.0279 against 0.0350 for historical
+simulation), and the ratio term is negligible.
+
+Two cautions against reading this as a diagnosis of which head is at fault:
+
+- **ES appears in every term.** It is the denominator of the shortfall penalty, so a smaller
+  |ES| lowers `log(−e)` while *inflating* the exceedance penalty `-(v-y)/(alpha*e)`. The two
+  effects are coupled and the net effect here happens to favour the MLP. A separate ES
+  problem could therefore be present and partly hidden by that offset.
+- **These are algebraic contributions of one scoring rule, not independent estimates of
+  head-specific error.** The decomposition says where in the loss the gap appears and how the
+  reported number would move if one component changed with the others held fixed. It cannot
+  say that the VaR head is wrong and the ES head right; holding the VaR forecast fixed while
+  moving ES is not a model that can exist here, because both come from the same two outputs.
+
+So: the gap is a VaR-exceedance phenomenon *within this loss*, and the ES head is neither
+implicated nor cleared.
 
 ### 3.5 Dates that recur across every seed and both baselines
 
@@ -219,8 +259,8 @@ Six dates appear in all twelve comparisons, and they are the well-known stress s
 the period (2016-06-24 Brexit referendum, 2016-09-09, the February 2018 and October 2018
 sell-offs, 2019-05-07). One entry is different in kind: on 2017-03-02 the realised return was
 −0.59%, historical simulation forecast −2.03% and the MLP forecast −0.44%, so an ordinary day
-became an exceedance for the MLP alone. That is the "too tight when calm" failure in its
-purest form and it appears in fewer comparisons precisely because the penalty is small.
+became an exceedance for the MLP alone. That is the calm-day pattern in its clearest form, and
+it appears in fewer comparisons than the stress dates precisely because the penalty is small.
 
 ---
 
@@ -228,19 +268,27 @@ purest form and it appears in fewer comparisons precisely because the penalty is
 
 Shows:
 
-1. The real-data alpha = 0.005 deficit is a **tail-shape** failure, not a level failure: the
-   average depth is close to GARCH–t, but the curve is compressed (2.63x across the grid
-   against 3.89x and 6.88x) and misallocated across the conditioning — too tight on calm days,
-   too shallow on stressed ones.
-2. The **shortfall term** carries essentially all of it; the ES level and the VaR/ES ratio do
-   not. Any redesign aimed at the ES head would be aimed at the wrong term.
+1. The deficit is **not explained by average depth alone**. Two candidates are visible and
+   average curves cannot separate them: insufficient separation across alpha levels (the curve
+   compresses 2.63x across the grid against 3.89x and 6.88x) and poor adaptation to market
+   conditions (too tight on calm days, too shallow on stressed ones, with a shallower average
+   than either baseline). Which one dominates — or whether it is their interaction, or an
+   interaction with how the ES head adapts — is **not established** by this decomposition.
+   Naming a mechanism would need an intervention that varies one factor while holding the
+   other fixed; none was run.
+2. The **shortfall term** carries essentially all of the gap within this scoring rule, with the
+   log(−ES) and ratio terms acting as small offsets. That localises *where in the loss* the
+   gap appears. It does **not** apportion blame between the VaR and ES heads: ES is the
+   shortfall denominator, so the terms are coupled, and the ES head is neither implicated nor
+   cleared.
 3. The magnitude of the FZ0 gap is **dominated by about ten dates** (69.6–94.4% of all positive
    differences), six of which are common to every seed and every comparison. At alpha = 0.005
    this is unavoidable arithmetic: the hinge penalty scales as 1/alpha, so one −3.7% day
    against a −1.2% VaR contributes ~254 points to a mean of ~0.8.
 4. The finding is **stable across seeds** in structure (same dates, same term, same sign) even
    though the exceedance count and the mean gap move with the seed. Seed variability is not
-   what separates the MLP from the baselines here.
+   what separates the MLP from the baselines here. Stability across seeds is not breadth of
+   evidence: all three seeds see the same 1,006 dates.
 5. The alpha = 0.010 deficit has the same origin as alpha = 0.005, with weaker amplification
    and less concentration (top-10 share 69.6–87.7%).
 
@@ -249,9 +297,11 @@ Does not show:
 - That the MLP is worse overall on real data. It is better on 75–80% of validation dates at
   alpha = 0.005, and better at alpha = 0.025–0.200. It is worse on the mean of all six levels
   because the levels are averaged equally.
-- That a fix would help. Nothing here was tested as an intervention; a shallower or deeper
-  tail head, a per-alpha calibration, more capacity or more epochs are all untested, and the
-  first of them is exactly the kind of change the one-experiment budget reserves for Tier 3.
+- That a fix would help. Nothing here was tested as an intervention; a deeper or differently
+  parameterised tail, a per-alpha calibration, more capacity or more epochs are all untested,
+  and the first of them is exactly the kind of change the one-experiment budget reserves for
+  Tier 3.
+- Which head to change, or whether changing either head is the right move at all.
 - Anything about the test period, about a second index, or about the synthetic cases beyond
   what the earlier summary already reported.
 - The statistical significance of a ~0.8 FZ0 gap on 1,006 dependent observations with 5.03
@@ -259,11 +309,24 @@ Does not show:
 
 ---
 
-## 5. Consequence for Stage 1
+## 5. Consequence for Stage 1 and the research tiers
 
 The baseline-implementation gate does not require the MLP to win. Three baselines now run
 through the same protocol, the same mask, the same evaluator and the same verifier, and the
 comparison is reproducible end to end at ~7 minutes. Stage 1 is recorded as complete on that
 basis (STATUS.md), with the alpha = 0.005 result reported as a property of the third baseline
-rather than a blocking defect — and with the diagnostic above available as the starting point
-if a later tier chooses to act on it.
+rather than a blocking defect.
+
+**Tier 3 is left unspent** (decision recorded 2026-11-04). The diagnostic motivates questions
+for the planned comparison; it does not justify a separate redesign, and the one investigation
+the Tier-3 budget allows is better spent inside Stage 3 where a comparator supplies an external
+reference point. The prescribed progression is unchanged: Stage 2 (reusable delivery —
+documented setup, a lawful synthetic example, the WorkSwarm skill, and a fresh execution with
+evidence), then Stage 3 (constrained model plus published comparator, informed by the
+independent research audit).
+
+One caution to carry into Stage 3: enforcing coherent risk curves through a constrained
+specification does **not** by itself fix extreme-tail miscalibration. A model can be internally
+coherent and still mis-cover alpha = 0.005. If the constrained model is evaluated against the
+same 1,006 validation dates, the per-seed exceedance counts and the concentration statistics in
+this document are the relevant comparison points, not the equal-weight mean alone.
