@@ -4,7 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-.venv/
+.venv
 venv/
 *.egg-info/
 build/
@@ -16,10 +16,16 @@ htmlcov/
 /outputs/*
 !/outputs/README.md
 /data/
+# Local scratch space (regeneration copies, ad-hoc configs, captured logs)
+/.tmp/
 # The worked example ships its generator, not its bytes: the CSV is regenerated
 # deterministically by examples/custom_model/make_demo_returns.py.
 /examples/custom_model/data/
 *.log
+
+# Presentation drafts: demo/index.html is the canonical output of
+# demo/build_demo.py and the only page shipped; alternate drafts stay local.
+/demo/tailrisk_demo.html
 
 # Credentials and local editor/OS state
 .env
