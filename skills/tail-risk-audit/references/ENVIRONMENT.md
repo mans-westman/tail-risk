@@ -1,8 +1,10 @@
 # Tested environment
 
-What this page is: the environment in which the commands in the top-level `README.md` and in
-`examples/README.md` were actually run, with the runtimes measured there. It is a record, not
-a lock file and not a support statement.
+What this page is: the environment in which the commands in the top-level `README.md`, in
+`examples/README.md` and in `skills/tail-risk-audit/` were actually run, with the runtimes
+measured there. The exact package versions are pinned in `requirements-tested.txt` at the
+repository root; this page records the host, what was measured, and where the boundaries of
+the claim are.
 
 What it is not: a guarantee for other platforms, interpreters or dependency versions.
 `pyproject.toml` declares ranges, not pins; every run records the interpreter and the
@@ -13,19 +15,56 @@ between the verifying interpreter and a run's manifest when a refit is involved.
 
 | Item | Value |
 |---|---|
-| Recorded | 2026-11-10; suite counts re-measured 2026-11-11 (after the S2.6 adapter tests and the curve-figure regression test) |
+| Recorded | 2026-11-10; suite counts re-measured 2026-11-11 and again 2026-11-23 |
 | Host | macOS 15.6, arm64 (`Darwin-arm64`) |
-| Interpreter | CPython 3.13.15, virtual environment created with `python3 -m venv .venv` |
-| Package | `tailrisk` 0.1.0, installed editable (`pip install -e ...`) |
-| Shell | zsh; commands run from the repository root |
+| Interpreter | CPython 3.13.15, virtual environments created with `python3 -m venv` |
+| Package | `tailrisk` 0.1.0 — editable from the checkout for development, and as a built wheel for the clean-install check |
+| Exact pins | `requirements-tested.txt` (repository root), 31 packages including the optional extras |
+| Shell | zsh; commands run from the repository root unless stated |
 
 ## Installation used
 
+Two routes, for two different readers:
+
 ```sh
+# Library use: ranges from pyproject.toml, only what the quickstart needs
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[baselines]'      # quickstart: historical simulation + GARCH-t
+python -m pip install -e '.[baselines]'
+
+# Reproducing the tested release: the exact pinned set, then the package with no re-resolution
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-tested.txt
+python -m pip install -e . --no-deps
 ```
+
+`--no-deps` is deliberate: the requirements file already contains every runtime, optional and
+test dependency at the tested version, so a second resolution could move a pin.
+
+### Tested, declared, and merely resolvable
+
+These are three different claims and this release only makes the first one:
+
+| Claim | Status |
+|---|---|
+| CPython 3.13.15 with the versions in `requirements-tested.txt` | **Tested** — the suite and all documented runs below were executed there |
+| `requires-python = ">=3.10"` | **Declared** — the dependencies resolve on 3.10 (numpy 2.2.6, scipy 1.15.3, pandas 2.3.3, arch 9.0.0, matplotlib 3.10.9, jax 0.6.2 as resolved on 2026-11-23); **no 3.10 interpreter was available here, so the suite was not run on it** |
+| Any other platform, interpreter or dependency version | **Not claimed** — including Linux and Windows |
+
+The CI workflow's `tests` matrix runs 3.10 and 3.13 on Linux. Until those jobs have actually run
+remotely, 3.10 remains a declared range, not a tested one.
+
+### Dependencies may resolve outside the pinned set
+
+Because `pyproject.toml` uses ranges, a fresh `pip install -e '.[baselines]'` on 2026-11-23
+installed `arch` 9.0.0, not the tested 8.0.0. That was checked specifically: with `arch` 9.0.0 a
+41,232-row student-t run completed, its `verify` reported 27/27 applicable checks with 0
+unavailable, and `tests/test_garch_model.py` plus `tests/test_adapter_parity.py` passed. The
+pinned 8.0.0 remains the version the release was measured on. A future `arch` release is not
+covered by either check.
+
+## Optional extras
 
 Extras, and what each one makes possible:
 
@@ -33,15 +72,41 @@ Extras, and what each one makes possible:
 |---|---|---|---|
 | — | numpy, scipy, pandas | everything: import, `--help`, historical simulation, custom adapters | — |
 | `baselines` | `arch` | `garch_student_t` | configs listing it stop with an install hint; other models still run |
-| `neural` | `jax`, `optax` | `joint_mlp` | `configs/examples/student_t_mlp.json` cannot run; the rest of the suite skips its MLP tests |
+| `neural` | `jax`, `optax` | `joint_mlp` | `configs/examples/student_t_mlp.json` cannot run; the suite skips its MLP tests |
 | `plots` | `matplotlib` | `report --plots` | `report` still writes Markdown/JSON; `--plots` fails with the install command |
 | `data` | `pandas_market_calendars` | optional exchange-session cross-check in `ingest` | the check is recorded as skipped; ingestion does not guess a calendar |
 | `dev` | `pytest`, `arch` | the test suite | — |
 
-Installed versions in this record: numpy 2.5.4, scipy 1.18.1, pandas 3.1.1, arch 8.0.0,
-matplotlib 3.11.2, pytest 9.2.0. The MLP timings below used jax 0.12.0.1 and optax 0.2.8 with
-`JAX_ENABLE_X64=1`, which the MLP path requires for float64 parity with the saved
-checkpoints.
+Absence was tested, not assumed, in a wheel-installed environment with only numpy, scipy and
+pandas:
+
+| Action | Result |
+|---|---|
+| `python -m tailrisk --help` | exit 0 |
+| historical-simulation-only run → verify → evaluate → report | all exit 0; 14,988 forecasts; 32/32 offline checks; 27 applicable artifact checks; Markdown and JSON report written |
+| `report --plots` | exit 2, `plotting requires Matplotlib … install it with pip install 'tailrisk[plots]'` |
+| a config listing `garch_student_t` | exit 1, `ImportError: the GARCH-t model requires the arch package … pip install 'tailrisk[baselines]'` |
+| a config listing `joint_mlp` | exit 1, `ImportError: the joint MLP requires the optional neural extra (jax, optax) … pip install 'tailrisk[neural]' and set JAX_ENABLE_X64=1` |
+
+The `data` extra was never installed in a tested environment, which is why the calendar check is
+*skipped* in both suite rows below rather than passing. `pandas_market_calendars` is therefore
+not pinned in `requirements-tested.txt`.
+
+## Custom adapter imports
+
+A configured factory is imported by ordinary `importlib` from the interpreter's `sys.path`; the
+toolkit does not add the repository to that path. Running `python -m tailrisk` from the
+repository root puts the root on `sys.path`, which is why
+`examples.ewma_gaussian_adapter.model:create_model` resolves there and nowhere else. This was
+confirmed both ways with the wheel installed:
+
+| Working directory | Result |
+|---|---|
+| the repository root | the EWMA example ran: 67,476 forecast rows, 33/33 applicable checks, checkpoint replay 26,244/26,244 |
+| a directory outside the checkout | exit 2, `custom factory module 'examples.ewma_gaussian_adapter.model' is not importable … run from a directory where it resolves` |
+
+The adapter contract is unchanged: a factory is still `module:function`, arbitrary Python in the
+runner's process, and nothing here sandboxes it.
 
 ## Measured runtimes
 
@@ -69,32 +134,44 @@ about 23 with them.
 
 | Environment | Extras installed | Result |
 |---|---|---|
-| fresh venv (scratch directory, not committed) | `dev` + `plots` (`dev` already supplies `arch`); **no** `neural`, **no** `data` | **423 passed, 10 skipped in 20.0-21.0 s** |
-| development environment | `dev` + `neural` + `plots`; **no** `data` | **549 passed, 1 skipped in 67.3-180.8 s** |
+| no `neural`, no `data` | core + `baselines` + `plots` + `dev` (numpy, scipy, pandas, arch 8.0.0, matplotlib 3.11.2, pytest 9.2.0) | **423 passed, 10 skipped in 74.8 s** |
+| pinned env, with `neural` | `requirements-tested.txt`, `JAX_ENABLE_X64=1` | **549 passed, 1 skipped in 147.1–186.0 s** (two runs) |
 
-The fresh environment was built by installing `.[baselines]`, then `.[plots]`, then `.[dev]`, so
-the net extras are `dev` + `plots`. Its 10 skips are explicit: six `joint_mlp` adapter-parity
-cases, one MLP core module, two MLP training/integration modules, and the exchange-calendar
-cross-check. None of them fails silently.
+The 10 skips in the first row are explicit: six `joint_mlp` adapter-parity cases, one MLP core
+module, two MLP training/integration modules, and the exchange-calendar cross-check. None of
+them fails silently. The second row removes nine of those skips by installing JAX and Optax; its
+single skip is the calendar check, because the `data` extra is not in the pinned set either.
 
-The development environment has JAX and Optax, so the MLP tests run there; its single skip is the
-calendar cross-check, because `pandas_market_calendars` (the `data` extra) is not installed in it
-either. No environment in this record has `data` installed, which is why that check is skipped
-in both rather than passing.
+Earlier records of this suite read 423/10 and 537–549/1; the counts moved as tests were added.
+The numbers above are from the 2026-11-23 release check.
 
-## Reproducing the record
+## Release-verification commands (2026-11-23)
+
+Run on the host above, in fresh environments outside the checkout:
 
 ```sh
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e '.[dev,plots,neural]'   # matches the development row; add ,data to exercise the calendar check
-python -m pytest -q
+# full pinned environment
+python -m pip install -r requirements-tested.txt
+python -m pip install -e . --no-deps
+JAX_ENABLE_X64=1 python -m pytest -q
+
+# clean wheel, non-editable, run from outside the checkout
+python -m pip wheel . --no-deps -w /tmp/tr-dist
+python -m venv /tmp/tr-core
+/tmp/tr-core/bin/python -m pip install /tmp/tr-dist/tailrisk-0.1.0-py3-none-any.whl 'arch==8.0.0' 'matplotlib==3.11.2'
+cd /tmp/tr-work && /tmp/tr-core/bin/python -m tailrisk run \
+  --config /path/to/tail-risk/configs/examples/student_t.json --output quickstart
 ```
 
-`plots` is not decoration here: the figure tests call `report --plots` and expect it to succeed,
-so without Matplotlib they fail rather than skip. `neural` is what turns the 10 skips into one.
-Installing `.[dev]` alone therefore does not reproduce either row above.
+The clean-wheel quickstart produced 41,232 forecast rows, 27/27 applicable checks with 0
+unavailable and 0 failed, 24 metric rows and three PNGs — the same counts as the documented
+quickstart. If your checkout lives inside a cloud-synced folder (such as a synced desktop or
+Documents directory) where virtual-environment reads stall, create the environment outside the
+synced tree (for example `~/.venvs/tailrisk`) and either invoke its interpreter directly or
+symlink `.venv` to it.
+
+## If the suite reports different numbers
 
 If the suite reports a different pass count, the difference is either a missing optional extra
-(the skip lines name it) or a changed dependency version; compare `pip freeze` against the
-versions above before treating it as a code change.
+(the skip lines name it) or a changed dependency version; compare `pip freeze` against
+`requirements-tested.txt` before treating it as a code change.
