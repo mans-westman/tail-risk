@@ -97,8 +97,7 @@ outside the configured grid.
 ## The report
 
 `report` writes `report.md` (primary) and `report.json` (schema version 1, the
-agent-readable equivalent). The eight sections are fixed and ordered by
-`docs/STAGE2_IMPLEMENTATION.md` §4:
+agent-readable equivalent). The eight sections are fixed and ordered:
 
 1. **Experiment** — question, data and provenance, units, horizon, splits, exposure status,
    seeds, runtime, versions.

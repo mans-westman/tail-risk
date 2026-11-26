@@ -8,7 +8,7 @@ an LLM. It reads the run directory and writes two files. Every claim in the outp
 a saved table or check, because a report that recomputes its own evidence is a report nobody
 can reproduce.
 
-The eight sections are fixed by ``docs/STAGE2_IMPLEMENTATION.md`` §4, in that order. They
+The eight sections are fixed by ``docs/REPORTING.md``, in that order. They
 deliberately keep four different things apart: *integrity* (did the artifacts survive and
 replay), *verification coverage* (which checks could actually run), *finite-grid structure*
 (do the curves cross) and *statistical performance* (how did the scores compare). A high

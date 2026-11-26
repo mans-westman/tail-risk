@@ -303,10 +303,11 @@ execution evidence, not the assistance, determine what is established.
 `src/`, `tests/`, `docs/`, `configs/examples/`, `examples/`, `skills/`, `demo/` and
 `evidence/stage2/s26/` are the release, together with `LICENSE` and `requirements-tested.txt`. `outputs/` and
 `data/` are gitignored: run directories and market snapshots are never committed, and
-[outputs/README.md](outputs/README.md) explains the local-only policy. Two root documents — the
-2026-11-04 experiment protocol and the FZ0 decomposition note — are internal development records
-kept for provenance; the run directories and data snapshots they name are not distributed, so
-their commands are not reproducible from a clone.
+[outputs/README.md](outputs/README.md) explains the local-only policy. Internal planning
+documents and the 2026-11-04 development research record (experiment protocol, FZ0 decomposition
+note, its configurations and analysis script) are preserved outside the public tree; the run
+directories and data snapshots they name were never distributed, so their commands are not
+reproducible from a clone. Earlier published versions remain in the Git history.
 
 `demo/index.html` is a self-contained offline presentation built from the fresh-agent EWMA run; it needs no
 installation or network. [demo/README.md](demo/README.md) documents its controls and the honest

@@ -620,7 +620,7 @@ class JointMlpAdapter:
         """Write the checkpoint under ``directory``; return nothing.
 
         Persistence is a side effect, so the contract's saver returns ``None`` (see
-        ``docs/STAGE2_IMPLEMENTATION.md`` §4: ``save_checkpoint(directory) -> None``). What
+        ``docs/MODEL_ADAPTER.md``, Checkpoints: ``save_checkpoint(directory) -> None``). What
         was written is read back separately with :meth:`checkpoint_metadata`, so a caller
         cannot come to depend on a return value that a hand-written or third-party saver
         may not produce.
