@@ -18,6 +18,25 @@ result. No comparison in this repository establishes predictive superiority.
 or package index publication yet. The checkout is the distribution: installation is
 `pip install -e .` from the cloned tree.
 
+![Tailrisk workflow: synthetic benchmark or local daily-return CSV and built-in or adapted models enter Run, Verify, Evaluate and Report. Humans and the optional WorkSwarm skill invoke the same CLI.](docs/figures/readme/workflow.svg)
+
+*Fit your model, compare it with standard baselines on the same dates, and inspect the report.*
+See the [offline quickstart](#quickstart-offline) and [report guide](docs/REPORTING.md).
+
+## Documentation map
+
+| I want to… | Read |
+|---|---|
+| Run the offline quickstart | [Quickstart](#quickstart-offline) · [examples/](examples/README.md) |
+| Follow a worked model integration end to end | [docs/TUTORIAL_EWMA.md](docs/TUTORIAL_EWMA.md) |
+| Bring my own returns CSV | [docs/DATA_CONTRACT.md](docs/DATA_CONTRACT.md) |
+| Bring my own model | [docs/MODEL_ADAPTER.md](docs/MODEL_ADAPTER.md) |
+| Understand the scores, tables and artifacts | [docs/REPORTING.md](docs/REPORTING.md) · [docs/METHODS.md](docs/METHODS.md) |
+| Reproduce the tested environment | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
+| See the fresh-agent trial evidence | [evidence/stage2/s26/](evidence/stage2/s26/03_RESULTS.md) |
+| View the offline presentation | [demo/](demo/README.md) |
+| Use the WorkSwarm skill | [skills/tail-risk-audit/](skills/tail-risk-audit/SKILL.md) |
+
 ## Install
 
 Obtain the repository, then run every command on this page **from its root**:
@@ -163,13 +182,23 @@ pretrained state, and the manifest records its declarations plus a hash of the i
 rather than proving their absence. There is **no universal leakage guarantee**, and the
 verification checks listed in [docs/METHODS.md](docs/METHODS.md) are the ones that ran.
 
-Contract and worked example: [docs/MODEL_ADAPTER.md](docs/MODEL_ADAPTER.md).
+Contract: [docs/MODEL_ADAPTER.md](docs/MODEL_ADAPTER.md); step-by-step worked tutorial:
+[docs/TUTORIAL_EWMA.md](docs/TUTORIAL_EWMA.md).
 `examples/bring_your_model/` holds a standalone EWMA–Gaussian forecast that is deliberately
 *not* registered — the raw function a researcher adapts through that contract.
 `examples/ewma_gaussian_adapter/` is the integration of exactly that function: it calls the
 supplied code with the causal history the runner hands over and maps the result onto contract
-v1, without editing or reimplementing the mathematics. The S2.6 trial below is that case run
-end to end by a fresh agent.
+v1, without editing or reimplementing the mathematics. The fresh-agent trial below is that case
+run end to end.
+
+![EWMA integration example: a researcher supplies a standalone function, an adapter joins it with historical simulation and GARCH-t, and the toolkit produces a matched comparison and report. The plot shows EWMA returns, VaR and ES on 499 matched synthetic validation origins at alpha 0.025, with 12 VaR exceedances.](docs/figures/readme/ewma-use-case.svg)
+
+*This example demonstrates the workflow on synthetic Gaussian GARCH data; it does not
+establish performance on market data. Signed decimal log returns; α = 0.025.*
+The 12 plotted exceedances belong to this matched sample, not the 43 exceedances on EWMA’s
+1,437 available origins. See the [adapter tutorial](docs/MODEL_ADAPTER.md),
+[trial results](evidence/stage2/s26/03_RESULTS.md) and
+[figure sources and regeneration](docs/figures/readme/README.md).
 
 ## Optional extras
 
@@ -201,12 +230,13 @@ cp -R skills/tail-risk-audit ~/.jiuwenswarm/agent/workspace/skills/
 The engine still has to be installed where that session runs (`python -m pip install -e
 '.[baselines]'`, or the package plus its extras); the skill does not vendor the code.
 
-## WorkSwarm trial (S2.6)
+## Fresh-agent EWMA integration trial
 
 `skills/tail-risk-audit/` was installed into a live workspace and a **fresh WorkSwarm agent**
-was given the repository and the task, not the solution. The agent read the skill and the
-adapter documentation, wrote `examples/ewma_gaussian_adapter/` and
-`configs/examples/gaussian_ewma.json`, and ran both documented runs end to end.
+was given the repository and the task, not the solution. It read the skill and the adapter
+documentation, wrote `examples/ewma_gaussian_adapter/` and
+`configs/examples/gaussian_ewma.json`, and ran both documented runs end to end. The supplied
+model file was read and called, never edited.
 
 | What ran | Result |
 |---|---|
@@ -215,31 +245,27 @@ adapter documentation, wrote `examples/ewma_gaussian_adapter/` and
 | baseline invariance | the 24 baseline metric rows are equal across the two runs (`pandas.DataFrame.equals` on the saved `metrics.csv` tables — an equality check on the parsed rows, not a byte-level file comparison) |
 | scoring | common mask: 1,999 train / 499 validation origins; EWMA 12 exceedances on the matched sample at 0.025 (43 on its own 1,437 available origins) |
 
-The supplied model file was read and called, never edited. Record, commands, runtimes,
-figures and the limitations of the evidence: [evidence/stage2/s26](evidence/stage2/s26/03_RESULTS.md).
-
-Review of that trial found one reporting defect: the curve figure selected rows by origin label
-alone, so it merged the train and validation paths (36 rows, 18 duplicate `(model, alpha)`
-pairs). It is fixed, with a regression fixture; the figures were regenerated from copies of the
-saved artifacts without refitting or rescoring, and the trial's originals are kept as clearly
-labelled superseded evidence. See [04_REPAIR.md](evidence/stage2/s26/04_REPAIR.md).
+Record, commands, runtimes, figures and the limitations of the evidence:
+[evidence/stage2/s26](evidence/stage2/s26/03_RESULTS.md). A post-trial review found one
+curve-figure defect — rows selected by origin label alone merged the train and validation paths
+(36 rows, 18 duplicate `(model, alpha)` pairs). It is fixed with a regression fixture; the
+figures were regenerated from copies of the saved artifacts without refitting or rescoring, and
+the originals are kept as clearly labelled superseded evidence
+([04_REPAIR.md](evidence/stage2/s26/04_REPAIR.md)). The corrected figures received assistant
+visual review on 2026-11-11, not human inspection; the producing agent could not view images and
+checked file integrity and the plotted points instead
+([03_RESULTS.md §5](evidence/stage2/s26/03_RESULTS.md),
+[04_REPAIR.md §7](evidence/stage2/s26/04_REPAIR.md#7-subsequent-visual-review--2026-11-11)).
 
 **Where the evidence stops.** The trial is execution and reuse evidence from one synthetic
-series and one seed — not performance evidence, and not independent external validation.
-
-The three PNGs were produced by an agent whose runtime returns image metadata only and exposes
-no vision tool, so that agent **could not inspect them**; it checked that each file opens and
-passes PIL `verify()` at its recorded dimensions, and that the renderer received the documented
-points. A **separate reviewing assistant** afterwards inspected all three corrected figures on
-2026-11-11 and recorded what it saw. That is assistant visual review, not human inspection, and
-it does not replace the numerical checks — see
-[03_RESULTS.md §5](evidence/stage2/s26/03_RESULTS.md) and
-[04_REPAIR.md §7](evidence/stage2/s26/04_REPAIR.md#7-subsequent-visual-review--2026-11-11).
-
-Skill loading is evidenced by the runtime's own skill notice; the trial's authorisation is
-recorded as narrative, because no session transcript was archived.
+series and one seed — not performance evidence, and not independent external validation. Skill
+loading is evidenced by the runtime's own skill notice; the trial's authorisation is recorded as
+narrative, because no session transcript was archived.
 
 ## What this does not establish
+
+Causal input boundaries are safeguards; arbitrary model plugins remain trusted Python code.
+The WorkSwarm skill invokes tools; it does not calculate or independently certify forecasts.
 
 - No leakage certificate. The verification checks are the ones listed in
   [docs/METHODS.md](docs/METHODS.md); trusted local plugin code is not sandboxed, and no check
@@ -282,7 +308,7 @@ execution evidence, not the assistance, determine what is established.
 kept for provenance; the run directories and data snapshots they name are not distributed, so
 their commands are not reproducible from a clone.
 
-`demo/index.html` is a self-contained offline presentation built from the S2.6 run; it needs no
+`demo/index.html` is a self-contained offline presentation built from the fresh-agent EWMA run; it needs no
 installation or network. [demo/README.md](demo/README.md) documents its controls and the honest
 boundary of its regeneration: refreshing the embedded numbers needs a local copy of the documented
 EWMA run, which is reproducible but not distributed.

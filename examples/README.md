@@ -124,14 +124,18 @@ data are unchanged and their scores can be compared with case 2. As in case 4, u
 `examples.ewma_gaussian_adapter.model:create_model`. Expect 67,476 forecast rows, 33/33
 applicable verification checks and an adapter replay of 26,244/26,244.
 
-This is the case a fresh WorkSwarm agent executed in the S2.6 trial, and its results, figures and
-limitations are recorded in [the trial evidence](../evidence/stage2/s26/03_RESULTS.md).
+For a full step-by-step walkthrough — including WorkSwarm skill invocation, expected
+verification counts, and reading the matched-versus-available scorecard — see
+[docs/TUTORIAL_EWMA.md](../docs/TUTORIAL_EWMA.md). This is the case a fresh WorkSwarm agent
+executed in the S2.6 trial, and its results, figures and limitations are recorded in
+[the trial evidence](../evidence/stage2/s26/03_RESULTS.md).
 
 ## Where the rest of the documentation is
 
 | Page | Contents |
 |---|---|
 | [README](../README.md) | purpose, install, the commands, what each artifact means |
+| [TUTORIAL_EWMA](../docs/TUTORIAL_EWMA.md) | worked EWMA walkthrough: CLI/WorkSwarm run, verification, matched scorecard, adapter anatomy |
 | [METHODS](../docs/METHODS.md) | formulas, estimators, attribution, limitations |
 | [DATA_CONTRACT](../docs/DATA_CONTRACT.md) | the returns CSV and the ingestion config |
 | [MODEL_ADAPTER](../docs/MODEL_ADAPTER.md) | the Python model interface and checkpoints |
