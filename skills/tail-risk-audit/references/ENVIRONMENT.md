@@ -85,8 +85,8 @@ pandas:
 | `python -m tailrisk --help` | exit 0 |
 | historical-simulation-only run → verify → evaluate → report | all exit 0; 14,988 forecasts; 32/32 offline checks; 27 applicable artifact checks; Markdown and JSON report written |
 | `report --plots` | exit 2, `plotting requires Matplotlib … install it with pip install 'tailrisk[plots]'` |
-| a config listing `garch_student_t` | exit 1, `ImportError: the GARCH-t model requires the arch package … pip install 'tailrisk[baselines]'` |
-| a config listing `joint_mlp` | exit 1, `ImportError: the joint MLP requires the optional neural extra (jax, optax) … pip install 'tailrisk[neural]' and set JAX_ENABLE_X64=1` |
+| a config listing `garch_student_t` | exit 2, `run failed: the GARCH-t model requires the arch package … pip install 'tailrisk[baselines]'` (stops before fitting or creating outputs) |
+| a config listing `joint_mlp` | exit 2, `run failed: the joint MLP requires the optional neural extra (jax, optax) … pip install 'tailrisk[neural]' and set JAX_ENABLE_X64=1` (stops before fitting or creating outputs) |
 
 The `data` extra was never installed in a tested environment, which is why the calendar check is
 *skipped* in both suite rows below rather than passing. `pandas_market_calendars` is therefore

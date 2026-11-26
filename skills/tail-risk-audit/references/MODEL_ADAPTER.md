@@ -47,7 +47,7 @@ class MyAdapter:
 | `model_id` | must equal the id in `custom_models`; a mismatch is refused at construction |
 | `contract_version` | `1` |
 | `minimum_history` | positive int; the warm-up the runner must honour before the first origin |
-| `alpha_min`, `alpha_max` | inclusive adapter domain inside the toolkit's `[0.005, 0.20)` |
+| `alpha_min`, `alpha_max` | inclusive adapter domain inside the toolkit's `[0.005, 0.20]` |
 | `uses_validation` | `True` only if `fit` genuinely selects on the validation partition |
 | `replay_mode` | `"none"` or `"checkpoint"` |
 
@@ -64,6 +64,12 @@ no target, no realized return, no oracle, no panel and no file handle. Reading t
 from the arguments you are given is not possible; reading it from somewhere else in your own
 code is outside what any argument-level check can prevent, which is why the trust statement
 below exists.
+
+Treat `path_id` as an opaque path label rather than parsing split names from it: during `run`
+the runner passes `<dataset_id>:<split>` (for example `example_garch_gaussian:train`), whereas
+during `verify` checkpoint replay the verifier passes `<split>:replay` (for example
+`train:replay`). An adapter whose numerical output depends on the exact `path_id` string will
+fail replay.
 
 ### What the runner owns
 
@@ -117,13 +123,20 @@ a selected model with no declaration; a repeated id; a malformed `module:functio
 The factory is resolved and constructed **before any data is read**, so a malformed
 declaration fails without producing artifacts.
 
-`module:function` resolves from the working directory. Run from the repository root for the
-bundled example; `examples/` is a regular package for exactly that reason.
+`module:function` is resolved with Python's standard `importlib.import_module` against `sys.path`:
+an installed package, a regular package (with `__init__.py`), or a PEP 420 namespace package
+directory reachable on `sys.path` all work. Running `python -m tailrisk` from the repository
+root puts the root on `sys.path`, so bundled adapters such as
+`examples.custom_model.model:create_model` resolve there.
 
-## Checkpoints (optional capability)
+## Checkpoints (optional capability, recommended for full verification)
 
-If your state cannot be reproduced from settings alone, declare `replay_mode="checkpoint"`
-and provide all three:
+`replay_mode="none"` remains supported, but it prevents `verify` from replaying saved forecasts:
+replay is reported as `unavailable` (partial verification coverage), never as a pass. Whenever
+feasible — including for parameter-free models whose settings fit in a small JSON file — prefer
+`replay_mode="checkpoint"` so `verify` can replay every saved forecast with `fit` disabled.
+
+If you declare `replay_mode="checkpoint"`, provide all three:
 
 ```python
 def save_checkpoint(self, directory: Path) -> None:        # on the adapter

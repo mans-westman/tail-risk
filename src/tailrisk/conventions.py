@@ -7,6 +7,15 @@ SUPPORTED_ALPHA_MAX = 0.5
 CONSTRAINED_ALPHA_MAX = 0.20
 
 
+class OptionalDependencyError(ImportError):
+    """Raised when a configured feature requires an uninstalled optional extra.
+
+    Subclasses :class:`ImportError` so callers catching ``ImportError`` keep working,
+    while CLI entry points can report missing optional extras cleanly without catching
+    unrelated import bugs.
+    """
+
+
 def validate_alpha(alpha: float, *, max_alpha: float = SUPPORTED_ALPHA_MAX) -> float:
     alpha = float(alpha)
     if not np.isfinite(alpha) or not 0.0 < alpha < max_alpha:

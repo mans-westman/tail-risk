@@ -129,7 +129,7 @@ error, not a silent crop.
 | `splits` | per-split targets, scored origins, attached context, and the cutoffs used |
 | `calendar` | `{"status": "not checked", "reason": ...}` |
 | `cross_check` | `null` |
-| `limitations` | the four statements below, in machine-readable form |
+| `limitations` | four machine-readable statements recording session completeness, date convention, gap declarations, and declared units (summarised alongside calendar and revision limits below) |
 
 `oracle_curves.csv` is **never** written for this data, even when the series was originally
 simulated: a supplied CSV carries no ground truth, and `dataset_kind` is `real`.

@@ -117,3 +117,133 @@ def test_run_preserves_existing_outputs_before_loading_data(tmp_path, monkeypatc
     assert "fresh output directory" in capsys.readouterr().err
     if not existing_file:
         assert list(output.iterdir()) == [marker]
+
+
+def _minimal_synthetic_config(**overrides) -> dict:
+    config = {
+        "schema_version": 1,
+        "run_id": "strict_check",
+        "dataset_id": "garch_gaussian_strict",
+        "dgp": {"innovation": "gaussian", "omega": 5e-6, "a": 0.05, "b": 0.9, "burn_in": 100},
+        "partitions": {"train": 150, "validation": 100},
+        "seeds": {"train": 11, "validation": 22},
+        "splits": ["train", "validation"],
+        "alpha_grid": [0.025, 0.05],
+        "historical_window": 50,
+        "models": ["historical_simulation"],
+    }
+    config.update(overrides)
+    return config
+
+
+@pytest.mark.parametrize(
+    "mutator, expected_text",
+    [
+        (lambda c: c.__setitem__("historical_widnow", 200), "unknown config key"),
+        (lambda c: c["dgp"].__setitem__("omgea", 1e-5), "unknown dgp key"),
+        (lambda c: c["partitions"].__setitem__("trian", 150), "unknown split key"),
+        (lambda c: c["seeds"].__setitem__("validatoin", 22), "unknown split key"),
+        (lambda c: c.pop("seeds"), "require 'seeds'"),
+        (lambda c: c.pop("partitions"), "require 'partitions'"),
+        (lambda c: c["dgp"].pop("omega"), "dgp.omega is required"),
+        (lambda c: c.__setitem__("historical_window", "100"), "historical_window must be"),
+        (lambda c: c.__setitem__("historical_window", True), "historical_window must be"),
+        (lambda c: c.__setitem__("alpha_grid", "0.05"), "alpha_grid"),
+        (lambda c: c.__setitem__("models", "historical_simulation"), "models must be"),
+        (lambda c: c["partitions"].__setitem__("train", "150"), "partitions.train"),
+        (lambda c: c["seeds"].__setitem__("train", True), "seeds.train"),
+        (lambda c: c.__setitem__("dgp", "gaussian"), "'dgp' must be a JSON object"),
+        (lambda c: c.__setitem__("schema_version", True), "schema_version"),
+    ],
+)
+def test_run_strict_config_validation_stops_before_creating_output(
+    tmp_path, monkeypatch, capsys, mutator, expected_text
+):
+    from tailrisk import cli
+
+    config = _minimal_synthetic_config()
+    mutator(config)
+    config_path = tmp_path / "invalid.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    out_dir = tmp_path / "never_created"
+
+    def unexpected_load(*args):
+        pytest.fail("invalid config must not trigger data loading or fitting")
+
+    monkeypatch.setattr(cli, "_load_run_series", unexpected_load)
+    assert cmd_run(str(config_path), str(out_dir)) == 2
+    stderr = capsys.readouterr().err
+    assert "run failed:" in stderr
+    assert expected_text in stderr
+    assert not out_dir.exists()
+
+
+def test_run_reports_missing_optional_dependency_before_creating_output(
+    tmp_path, monkeypatch, capsys
+):
+    from tailrisk import cli
+    from tailrisk.conventions import OptionalDependencyError
+
+    config = _minimal_synthetic_config(models=["historical_simulation", "garch_student_t"])
+    config_path = tmp_path / "needs_arch.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    out_dir = tmp_path / "no_arch_out"
+
+    def fail_preflight(models):
+        raise OptionalDependencyError(
+            "the GARCH-t model requires the `arch` package; install with `pip install 'tailrisk[baselines]'`"
+        )
+
+    def unexpected_load(*args):
+        pytest.fail("missing optional dependency must stop before loading series")
+
+    monkeypatch.setattr(cli, "_preflight_builtin_dependencies", fail_preflight)
+    monkeypatch.setattr(cli, "_load_run_series", unexpected_load)
+    assert cmd_run(str(config_path), str(out_dir)) == 2
+    stderr = capsys.readouterr().err
+    assert "run failed:" in stderr
+    assert "tailrisk[baselines]" in stderr
+    assert not out_dir.exists()
+
+
+def test_run_does_not_swallow_unexpected_programming_bugs(tmp_path, monkeypatch):
+    from tailrisk import cli
+
+    config_path = tmp_path / "valid.json"
+    config_path.write_text(json.dumps(_minimal_synthetic_config()), encoding="utf-8")
+
+    def boom(*args, **kwargs):
+        raise AttributeError("simulated internal bug")
+
+    monkeypatch.setattr(cli, "run_model", boom)
+    with pytest.raises(AttributeError, match="simulated internal bug"):
+        cmd_run(str(config_path), str(tmp_path / "bug_out"))
+
+
+def test_all_shipped_run_configs_remain_valid():
+    from pathlib import Path
+    from tailrisk.cli import _load_config, _resolve_config
+
+    repo_root = Path(__file__).resolve().parents[1]
+    run_configs = [
+        p
+        for p in sorted(
+            list((repo_root / "configs").rglob("*.json"))
+            + list((repo_root / "examples").rglob("*.json"))
+        )
+        if "source" not in json.loads(p.read_text(encoding="utf-8"))
+    ]
+    assert run_configs, "expected shipped run configs"
+    for path in run_configs:
+        config = _load_config(path)
+        if isinstance(config.get("data"), dict) and config["data"].get("kind") == "returns_panel":
+            # Panel audit files live in gitignored data/ or outputs/; supply cutoffs directly
+            # when absent on disk so schema validation is exercised on every panel config too.
+            audit = config["data"].get("audit")
+            if audit and not (repo_root / audit).exists():
+                config = {
+                    **config,
+                    "cutoffs": {"train_end": "2014-12-31", "validation_end": "2019-12-31"},
+                }
+        resolved = _resolve_config(config)
+        assert resolved["schema_version"] == 1, str(path)

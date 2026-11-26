@@ -437,7 +437,9 @@ def _comparison_conditions(artifacts: RunArtifacts) -> dict:
             }
         )
 
-    conventional = {"historical_simulation", "garch_student_t"}
+    from .evaluation import CONVENTIONAL_BASELINE_IDS
+
+    conventional = set(CONVENTIONAL_BASELINE_IDS)
     matching = [
         {
             "claim": "every model is scored on the same realized returns within a cell",
@@ -668,8 +670,12 @@ def _performance(artifacts: RunArtifacts) -> dict:
         "paired_scores": paired,
         "paired_scores_available": paired is not None,
         "paired_note": None
-        if paired is not None
-        else "paired_scores.csv is absent; run `tailrisk evaluate --run ...` to write it",
+        if paired is not None and paired
+        else (
+            "no model pairs to compare (fewer than two models present)"
+            if paired is not None
+            else "paired_scores.csv is absent; run `tailrisk evaluate --run ...` to write it"
+        ),
         "sources": ["metrics.csv", "score_decomposition.csv", "paired_scores.csv"],
     }
 
@@ -1102,7 +1108,7 @@ def _render_performance(report: dict) -> list[str]:
         ]
     else:
         lines.append(f"- Unavailable — {performance['decomposition_identity']['note']}")
-    lines += ["", "Paired FZ0 differences versus conventional baselines (`paired_scores.csv`):", ""]
+    lines += ["", "Paired FZ0 differences on the common mask (`paired_scores.csv`):", ""]
     if performance["paired_scores_available"] and performance["paired_scores"]:
         rows = [
             [

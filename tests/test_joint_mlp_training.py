@@ -708,12 +708,18 @@ def test_checkpoint_records_architecture_constants_and_environment(
 
 
 def test_neural_training_is_not_imported_by_conventional_usage():
+    import os
+
+    src_dir = str(Path(__file__).resolve().parents[1] / "src")
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{existing}" if existing else src_dir
     script = (
         "import sys, tailrisk.models; "
         "print('jax' in sys.modules, 'optax' in sys.modules, 'tailrisk.models.joint_mlp' in sys.modules)"
     )
     result = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True, env=env
     )
     assert result.stdout.split() == ["False", "False", "False"]
 

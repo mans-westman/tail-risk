@@ -105,9 +105,11 @@ Two invariants keep the comparison honest:
   and explained in `failures.csv`; it is never clipped, sign-flipped, sorted or imputed.
   Coverage cost stays visible in `n_available`, `n_failed_rows` and `n_dropped_by_mask`.
 
-`paired_scores.csv` reports mean FZ0 differences between a model and each conventional
-baseline present, on that same mask. No standard error, confidence interval or significance
-star is produced: `n` is a count of dependent, overlapping origins, not independent samples.
+`paired_scores.csv` reports mean FZ0 differences for every unordered model pair present, on
+that same mask (each non-baseline model against every conventional baseline present, plus
+baseline-to-baseline and non-baseline peer pairs once each in roster order). No standard error,
+confidence interval or significance star is produced: `n` is a count of dependent, overlapping
+origins, not independent samples.
 
 ## Exceedance diagnostics
 
@@ -173,10 +175,9 @@ Software, at the versions recorded in each run's `manifest.json`:
 Those are the licences the installed packages declare; they are not a legal determination
 for redistribution, and the list is not a substitute for reading each licence.
 
-**No project licence has been selected.** Choosing one is a prerequisite for publication and
-is deliberately left to the project owner. Until then this repository grants no rights beyond
-what its dependencies' licences and applicable law allow, and market data is not
-redistributed (`data/` is ignored and `ingest` re-acquires from a config).
+This repository's own code is licensed under the MIT License (see `LICENSE` and
+`docs/LICENSING.md`). Market data is not redistributed (`data/` is ignored and `ingest`
+re-acquires from a config); code rights do not grant market-data redistribution rights.
 
 ## What is not claimed
 

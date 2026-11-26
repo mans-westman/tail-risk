@@ -102,8 +102,11 @@ causal `history` and the queried `alphas` and maps the result to one `Forecast` 
 `scale = sigma`, and `summary` reports the fixed settings. The `minimum_history` to declare is
 `warmup`, i.e. `63`: at exactly that many observations the model already produces a forecast, so a
 larger floor would reject histories it can serve. Registering it needs only a `custom_models` entry
-naming `module:function`; no evaluator source change is required, and `replay_mode` can be `"none"`
-because there is no checkpoint to replay.
+naming `module:function`; no evaluator source change is required. `replay_mode="none"` is
+supported, but it prevents `verify` from replaying saved forecasts (leaving verification coverage
+partial / `unavailable`). Whenever feasible, declare `replay_mode="checkpoint"` with a small JSON
+settings checkpoint — as done in `examples/ewma_gaussian_adapter/model.py` — so `verify` replays
+every forecast with `fit` disabled.
 
 That integration, the run and any comparison are intentionally **not** included here. They are
 the work the fresh agent must do from the public documentation.

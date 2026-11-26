@@ -17,9 +17,11 @@ be found in a saved table or check, it is a defect, not an approximation.
 
 ## The four tables
 
-`metrics.csv` keeps its columns and its meaning. The other three are additive and are
-derived from the *same* validated rows and the *same* common mask, so they cannot drift
-apart from `metrics.csv`.
+`metrics.csv` keeps its columns and its meaning. The other three tables are additive and are
+derived from the *same* validated rows: `score_decomposition.csv` and `paired_scores.csv` use
+the *same* common mask as `metrics.csv` (so their `n` and means cannot drift apart), whereas
+`curve_diagnostics.csv` intentionally evaluates each model's full emitted grids (`n_origins`
+and `n_grids_complete`) rather than restricting to the common mask.
 
 ### `score_decomposition.csv`
 
@@ -48,22 +50,20 @@ Per `(series_id, split, model_id, comparator_id, alpha)`:
 
 | Column | Meaning |
 |---|---|
-| `comparator_kind` | `conventional_baseline` for the non-neural built-ins |
+| `comparator_kind` | `conventional_baseline` when the comparator is a non-neural built-in (`historical_simulation`, `garch_student_t`), or `peer_model` for comparisons between two non-conventional models (custom adapters and/or neural models) |
 | `n` | size of the common mask for that cell (the same origins for both models) |
 | `mean_fz0_model`, `mean_fz0_comparator` | the two means on that mask |
 | `mean_difference` | `mean_fz0_model - mean_fz0_comparator`; negative means the model is better because lower FZ0 is better |
 
-Rows are emitted for every model against each conventional baseline present, with two
-rules that keep the table readable:
+Rows are emitted for every unordered model pair present in a cell, with three rules that keep
+the table readable and consistent:
 
 - a model is never compared with itself;
-- two conventional baselines are compared once, in configured roster order, rather than
-  twice with opposite signs.
-
-The second rule applies **only** when both sides are conventional baselines, because only
-then are the two differences mirror images. A model that is not a baseline is never
-suppressed: its difference to each baseline is the comparison the table exists to report, so
-the roster order cannot remove it.
+- a non-baseline model against a conventional baseline is always emitted as `(model, baseline)`
+  with `comparator_kind="conventional_baseline"`, regardless of roster order;
+- symmetric pairs — two conventional baselines (`conventional_baseline`), or two
+  non-conventional models (`peer_model`) — are emitted once each, in configured roster order
+  (later model minus earlier comparator), rather than twice with opposite signs.
 
 A cell whose mask is empty keeps its row with `n = 0` and empty means, so "nothing
 comparable" is visible instead of absent. No standard error, confidence interval, p-value or

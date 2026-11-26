@@ -679,19 +679,25 @@ def paired_scores(
     conventional: tuple[str, ...] = CONVENTIONAL_BASELINE_IDS,
     roster: list[str] | None = None,
 ) -> pd.DataFrame:
-    """Mean FZ0 of each model minus each conventional baseline, on the shared mask.
+    """Mean FZ0 differences for every unordered model pair on the shared mask.
 
     The difference is descriptive: ``n`` is the size of the common mask, the two means are
     computed on the same origins, and no standard error, interval or significance marker is
-    produced. ``mean_difference < 0`` means the model has the lower (better) FZ0. A cell
+    produced. ``mean_difference < 0`` means ``model_id`` has the lower (better) FZ0. A cell
     with an empty mask keeps its row with ``n = 0`` and NaN means, so "nothing comparable"
     is visible instead of absent.
 
-    A pair of conventional baselines is symmetric, so it is emitted once: a baseline model is
-    compared only against baselines that precede it in the configured roster. That rule is
-    restricted to baseline-to-baseline pairs. Suppressing a *model's* row because a baseline
-    happens to come later in the roster would drop the very comparison the table exists for,
-    and roster order is a configuration detail, not a statement about importance.
+    Direction rules:
+
+    - A non-baseline model against a conventional baseline is always emitted as
+      ``(model_id, baseline)`` with ``comparator_kind="conventional_baseline"``, regardless
+      of roster order, so a model's comparison against each baseline is never suppressed or
+      flipped by configuration ordering.
+    - A pair of conventional baselines is symmetric and emitted once in roster order
+      (later model minus earlier baseline) with ``comparator_kind="conventional_baseline"``.
+    - A pair of non-conventional models (custom adapters and/or neural models) is symmetric
+      and emitted once in roster order (later model minus earlier peer, falling back to
+      lexicographical order if omitted from ``roster``) with ``comparator_kind="peer_model"``.
     """
     if df.empty:
         return pd.DataFrame(columns=PAIRED_COLUMNS)
@@ -709,34 +715,32 @@ def paired_scores(
         )
 
     order = {model: index for index, model in enumerate(roster or [])}
+    conventional_set = set(conventional)
     records: list[dict] = []
     for (series_id, alpha), cell in df.groupby(["series_id", "alpha"], sort=False):
         present = set(cell["model_id"])
-        baselines = [name for name in conventional if name in present]
-        if not baselines:
+        if len(present) < 2:
             continue
+        baselines = [name for name in conventional if name in present]
+        peers = sorted(name for name in present if name not in conventional_set)
         a = float(alpha)
         n = int(len(masks.get((series_id, a), set())))
         split = _split_from_series(dataset_id, str(series_id))
+
+        # 1. Every model against every conventional baseline present (exact legacy contract).
         for model_id in sorted(present):
             model_mean = means.get((series_id, a, model_id), float("nan"))
             for baseline in sorted(baselines):
                 if baseline == model_id:
                     continue
                 if (
-                    model_id in conventional
+                    model_id in conventional_set
                     and baseline in order
                     and model_id in order
                     and order[baseline] > order[model_id]
                 ):
-                    # Only a pair of *conventional baselines* is symmetric: both are the
-                    # comparator's own kind, so the difference and its negative say the same
-                    # thing. Keep it once, in roster order. A model that is not a baseline is
-                    # never suppressed: its difference to each baseline is the comparison the
-                    # table exists to report, whatever position the roster gives it.
                     continue
                 base_mean = means.get((series_id, a, baseline), float("nan"))
-                difference = model_mean - base_mean
                 records.append(
                     {
                         "series_id": series_id,
@@ -748,7 +752,34 @@ def paired_scores(
                         "n": n,
                         "mean_fz0_model": model_mean,
                         "mean_fz0_comparator": base_mean,
-                        "mean_difference": difference,
+                        "mean_difference": model_mean - base_mean,
+                    }
+                )
+
+        # 2. Each unordered pair of non-conventional models once, in roster order.
+        for index, first in enumerate(peers):
+            for second in peers[index + 1 :]:
+                if first in order and second in order:
+                    if order[first] < order[second]:
+                        model_id, comparator_id = second, first
+                    else:
+                        model_id, comparator_id = first, second
+                else:
+                    model_id, comparator_id = second, first
+                model_mean = means.get((series_id, a, model_id), float("nan"))
+                comp_mean = means.get((series_id, a, comparator_id), float("nan"))
+                records.append(
+                    {
+                        "series_id": series_id,
+                        "split": split,
+                        "model_id": model_id,
+                        "comparator_id": comparator_id,
+                        "comparator_kind": "peer_model",
+                        "alpha": a,
+                        "n": n,
+                        "mean_fz0_model": model_mean,
+                        "mean_fz0_comparator": comp_mean,
+                        "mean_difference": model_mean - comp_mean,
                     }
                 )
     if not records:

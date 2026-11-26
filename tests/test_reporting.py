@@ -761,3 +761,125 @@ def test_curve_figure_selects_one_series_not_every_path_with_the_same_label(tmp_
     assert entry["available"] is True
     assert f"series {DATASET}_validation" in entry["caption"]
     assert (run / entry["path"]).is_file()
+
+
+# ---------------------------------------------------------------------------------------
+# generalized custom-versus-custom paired comparisons (Slice 2 / Tier 1.1)
+# ---------------------------------------------------------------------------------------
+
+
+def test_paired_scores_compare_custom_models_without_conventional_baselines(tmp_path):
+    rows = [
+        _row("ewma_94", 0, 0.05, -0.03, -0.04, realized=-0.05),
+        _row("ewma_94", 1, 0.05, -0.03, -0.04, realized=-0.01),
+        _row("ewma_94", 2, 0.05, -0.03, -0.04, realized=0.01),  # dropped by common mask
+        _row("ewma_97", 0, 0.05, -0.02, -0.03, realized=-0.05),
+        _row("ewma_97", 1, 0.05, -0.02, -0.03, realized=-0.01),
+    ]
+    roster = ["ewma_94", "ewma_97"]
+    result = evaluate_run(_frame(rows), pd.DataFrame(), DATASET, roster, [0.05])
+
+    assert len(result.paired) == 1
+    paired = result.paired.iloc[0]
+    assert paired.model_id == "ewma_97"
+    assert paired.comparator_id == "ewma_94"
+    assert paired.comparator_kind == "peer_model"
+    assert paired.n == 2
+    expected = np.mean(
+        [fz0_loss(-0.05, -0.02, -0.03, 0.05), fz0_loss(-0.01, -0.02, -0.03, 0.05)]
+    ) - np.mean([fz0_loss(-0.05, -0.03, -0.04, 0.05), fz0_loss(-0.01, -0.03, -0.04, 0.05)])
+    assert paired.mean_difference == pytest.approx(expected, rel=1e-12)
+
+    # End-to-end report rendering of a custom-only paired table.
+    run = _write_run(tmp_path, _frame(rows), models=roster, alphas=[0.05])
+    assert cmd_report(str(run), plots=False) == 0
+    payload = json.loads((run / "report.json").read_text(encoding="utf-8"))
+    rendered_pairs = payload["performance_by_alpha"]["paired_scores"]
+    assert len(rendered_pairs) == 1
+    assert rendered_pairs[0]["model_id"] == "ewma_97"
+    assert rendered_pairs[0]["comparator_id"] == "ewma_94"
+    assert rendered_pairs[0]["comparator_kind"] == "peer_model"
+    markdown = (run / "report.md").read_text(encoding="utf-8")
+    assert "`ewma_97`" in markdown and "`ewma_94`" in markdown
+
+
+def test_paired_scores_preserve_existing_rows_and_add_peer_pairs_once():
+    historical, garch = CONVENTIONAL_BASELINE_IDS[0], CONVENTIONAL_BASELINE_IDS[1]
+    roster = [historical, garch, "custom_a", "custom_b"]
+    rows = [
+        _row(model, 0, 0.05, -0.03 - 0.001 * idx, -0.04 - 0.001 * idx, realized=-0.02)
+        for idx, model in enumerate(roster)
+    ]
+    result = evaluate_run(_frame(rows), pd.DataFrame(), DATASET, roster, [0.05])
+
+    # All C(4, 2) = 6 unordered pairs appear once each.
+    assert len(result.paired) == 6
+    by_pair = {
+        (row.model_id, row.comparator_id): row.comparator_kind
+        for row in result.paired.itertuples(index=False)
+    }
+    assert by_pair == {
+        (garch, historical): "conventional_baseline",
+        ("custom_a", historical): "conventional_baseline",
+        ("custom_a", garch): "conventional_baseline",
+        ("custom_b", historical): "conventional_baseline",
+        ("custom_b", garch): "conventional_baseline",
+        ("custom_b", "custom_a"): "peer_model",
+    }
+
+    # Reversing roster flips symmetric pairs only; non-baseline vs baseline stays fixed.
+    reversed_roster = ["custom_b", "custom_a", garch, historical]
+    reversed_result = evaluate_run(_frame(rows), pd.DataFrame(), DATASET, reversed_roster, [0.05])
+    assert len(reversed_result.paired) == 6
+    reversed_by_pair = {
+        (row.model_id, row.comparator_id): row.comparator_kind
+        for row in reversed_result.paired.itertuples(index=False)
+    }
+    assert reversed_by_pair == {
+        (historical, garch): "conventional_baseline",
+        ("custom_a", historical): "conventional_baseline",
+        ("custom_a", garch): "conventional_baseline",
+        ("custom_b", historical): "conventional_baseline",
+        ("custom_b", garch): "conventional_baseline",
+        ("custom_a", "custom_b"): "peer_model",
+    }
+
+
+def test_paired_peer_cell_with_empty_mask_is_reported_not_omitted():
+    rows = [
+        _row("custom_a", 0, 0.05, -0.03, -0.04, realized=-0.02),
+        _row("custom_b", 1, 0.05, -0.03, -0.04, realized=-0.02),
+    ]
+    result = evaluate_run(_frame(rows), pd.DataFrame(), DATASET, ["custom_a", "custom_b"], [0.05])
+    assert (result.metrics["n"] == 0).all()
+    assert len(result.paired) == 1
+    row = result.paired.iloc[0]
+    assert row["model_id"] == "custom_b"
+    assert row["comparator_id"] == "custom_a"
+    assert row["comparator_kind"] == "peer_model"
+    assert row["n"] == 0
+    assert np.isnan(row["mean_difference"])
+
+
+def test_report_preserves_compatibility_with_saved_conventional_only_paired_csv(tmp_path):
+    historical, garch = CONVENTIONAL_BASELINE_IDS[0], CONVENTIONAL_BASELINE_IDS[1]
+    roster = [historical, garch, "custom_a", "custom_b"]
+    rows = [
+        _row(model, 0, 0.05, -0.03, -0.04, realized=-0.02)
+        for model in roster
+    ]
+    run = _write_run(tmp_path, _frame(rows), models=roster, alphas=[0.05])
+    # Simulate an older v0.1.0 artifact whose paired_scores.csv has only baseline pairs.
+    paired_path = run / "paired_scores.csv"
+    saved = pd.read_csv(paired_path)
+    legacy = saved[saved["comparator_kind"] == "conventional_baseline"]
+    assert len(legacy) == 5
+    legacy.to_csv(paired_path, index=False)
+
+    assert cmd_report(str(run), plots=False) == 0
+    payload = json.loads((run / "report.json").read_text(encoding="utf-8"))
+    assert len(payload["performance_by_alpha"]["paired_scores"]) == 5
+    assert all(
+        row["comparator_kind"] == "conventional_baseline"
+        for row in payload["performance_by_alpha"]["paired_scores"]
+    )

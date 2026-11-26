@@ -51,19 +51,19 @@ from __future__ import annotations
 
 import math
 
+from ..conventions import OptionalDependencyError, SUPPORTED_ALPHA_MAX
+
 try:  # the neural stack is an optional extra, not a runtime requirement
     import jax
     import jax.numpy as jnp
 except ImportError as exc:  # pragma: no cover - exercised by the missing-extra check
-    raise ImportError(
+    raise OptionalDependencyError(
         "the joint MLP requires the optional `neural` extra (jax, optax), which is not "
         "installed; install it with `pip install 'tailrisk[neural]'` and set "
         "JAX_ENABLE_X64=1 before running the MLP. Runs that do not configure `joint_mlp` "
         "do not need it."
     ) from exc
 import numpy as np
-
-from ..conventions import SUPPORTED_ALPHA_MAX
 
 #: Safety floor for both outputs, in standardized return units. It keeps forecasts
 #: strictly negative without allowing them to sit at exactly zero.

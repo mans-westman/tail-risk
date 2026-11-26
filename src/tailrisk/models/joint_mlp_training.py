@@ -34,12 +34,14 @@ from importlib.metadata import PackageNotFoundError, version as _distribution_ve
 from pathlib import Path
 from typing import Any, Iterator
 
+from ..conventions import OptionalDependencyError
+
 try:  # the neural stack is an optional extra, not a runtime requirement
     import jax
     import jax.numpy as jnp
     import optax
 except ImportError as exc:  # pragma: no cover - exercised by the missing-extra check
-    raise ImportError(
+    raise OptionalDependencyError(
         "the joint MLP requires the optional `neural` extra (jax, optax), which is not "
         "installed; install it with `pip install 'tailrisk[neural]'` and set "
         "JAX_ENABLE_X64=1 before running the MLP. Runs that do not configure `joint_mlp` "

@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from .artifacts import read_artifact_csv
+from .conventions import OptionalDependencyError, validate_alpha_grid, validate_nu
 from .features import FEATURE_WARMUP, build_feature_frame
 from .historical import historical_var_es
 from .models.protocol import CONTRACT_VERSION, invalid_output_reason
@@ -77,24 +78,75 @@ def _load_config(path: Path) -> dict:
         config = json.load(handle)
     if not isinstance(config, dict):
         raise ValueError("config must be a JSON object")
-    if config.get("schema_version") != 1:
+    version = config.get("schema_version")
+    if isinstance(version, bool) or version != 1:
         raise ValueError("unsupported config schema_version; expected 1")
     return config
 
 
 DATASET_SYNTHETIC = "synthetic_dgp"
 DATASET_PANEL = "returns_panel"
+VALID_SPLITS = ("train", "validation", "test")
+
+COMMON_RUN_KEYS = (
+    "schema_version",
+    "run_id",
+    "dataset_id",
+    "protocol",
+    "alpha_grid",
+    "historical_window",
+    "models",
+    "custom_models",
+    "mlp",
+    "splits",
+    "data",
+)
+SYNTHETIC_RUN_KEYS = COMMON_RUN_KEYS + ("dgp", "partitions", "seeds")
+PANEL_RUN_KEYS = COMMON_RUN_KEYS + ("cutoffs",)
+DGP_KEYS = ("innovation", "omega", "a", "b", "nu", "burn_in", "initial_variance")
+
+
+def _require_int(value: object, *, name: str, min_value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < min_value:
+        bound = "positive integer" if min_value == 1 else f"integer >= {min_value}"
+        raise ValueError(f"{name} must be a {bound}, got {value!r}")
+    return int(value)
+
+
+def _require_real(value: object, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(float(value)):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+    return float(value)
 
 
 def _resolve_common(resolved: dict) -> dict:
-    alpha_grid = list(resolved.get("alpha_grid", [0.005, 0.01, 0.025, 0.05, 0.1, 0.2]))
+    for text_key in ("run_id", "dataset_id", "protocol"):
+        value = resolved.get(text_key)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{text_key!r} must be a string when given, got {type(value).__name__}")
+
+    raw_grid = resolved.get("alpha_grid", [0.005, 0.01, 0.025, 0.05, 0.1, 0.2])
+    if not isinstance(raw_grid, (list, tuple)) or not raw_grid:
+        raise ValueError("'alpha_grid' must be a nonempty list of numbers")
+    alpha_grid = [_require_real(item, name="alpha_grid entry") for item in raw_grid]
+    validate_alpha_grid(alpha_grid)
     resolved["alpha_grid"] = alpha_grid
+
     resolved.setdefault("historical_window", 100)
-    if resolved["historical_window"] < 1:
-        raise ValueError("historical_window must be >= 1")
-    models = list(resolved.get("models", [MODEL_HISTORICAL]))
-    if not models:
+    resolved["historical_window"] = _require_int(
+        resolved["historical_window"], name="historical_window", min_value=1
+    )
+
+    raw_models = resolved.get("models", [MODEL_HISTORICAL])
+    if not isinstance(raw_models, (list, tuple)) or not raw_models:
         raise ValueError("models must be a nonempty list")
+    models: list[str] = []
+    for item in raw_models:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"models entries must be nonempty strings, got {item!r}")
+        models.append(item)
+    if len(set(models)) != len(models):
+        raise ValueError("models must not contain duplicate model ids")
     # A custom id is legitimate exactly when the configuration also declares its factory,
     # so the supported set is the built-ins plus this run's declarations -- not a list the
     # CLI has to be edited for.
@@ -115,7 +167,10 @@ def _resolve_common(resolved: dict) -> dict:
     if declared_splits is not None:
         if not isinstance(declared_splits, (list, tuple)) or not declared_splits:
             raise ValueError("'splits' must be a nonempty list of split names")
-        valid_splits = {"train", "validation", "test"}
+        bad_types = [s for s in declared_splits if not isinstance(s, str)]
+        if bad_types:
+            raise ValueError(f"'splits' entries must be strings, got {bad_types!r}")
+        valid_splits = set(VALID_SPLITS)
         unknown_splits = [s for s in declared_splits if s not in valid_splits]
         if unknown_splits:
             raise ValueError(
@@ -123,9 +178,9 @@ def _resolve_common(resolved: dict) -> dict:
             )
         if "train" not in declared_splits:
             raise ValueError("declared 'splits' must include 'train' for model fitting")
-        resolved["splits"] = [s for s in ("train", "validation", "test") if s in declared_splits]
+        resolved["splits"] = [s for s in VALID_SPLITS if s in declared_splits]
     else:
-        resolved["splits"] = ["train", "validation", "test"]
+        resolved["splits"] = list(VALID_SPLITS)
 
     return resolved
 
@@ -154,11 +209,20 @@ def _resolve_mlp(resolved: dict) -> dict:
         raise ValueError(
             "joint_mlp selects its checkpoint on validation rows; add 'validation' to 'splits'"
         )
-    seed = block.get("model_seed", 0)
-    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
-        raise ValueError("mlp.model_seed must be a non-negative integer")
+    seed = _require_int(block.get("model_seed", 0), name="mlp.model_seed", min_value=0)
+    if "learning_rate" in block:
+        lr = _require_real(block["learning_rate"], name="mlp.learning_rate")
+        if lr <= 0.0:
+            raise ValueError(f"mlp.learning_rate must be positive, got {lr!r}")
+    if "max_grad_norm" in block:
+        gn = _require_real(block["max_grad_norm"], name="mlp.max_grad_norm")
+        if gn <= 0.0:
+            raise ValueError(f"mlp.max_grad_norm must be positive, got {gn!r}")
+    for int_key in ("batch_size", "max_epochs", "patience"):
+        if int_key in block:
+            _require_int(block[int_key], name=f"mlp.{int_key}", min_value=1)
     resolved["mlp"] = {
-        "model_seed": int(seed),
+        "model_seed": seed,
         **{key: block[key] for key in MLP_BUDGET_KEYS if key in block},
     }
     return resolved
@@ -166,20 +230,66 @@ def _resolve_mlp(resolved: dict) -> dict:
 
 def _resolve_synthetic(resolved: dict) -> dict:
     dgp = resolved["dgp"]
+    if not isinstance(dgp, dict):
+        raise ValueError("'dgp' must be a JSON object")
+    unknown_dgp = sorted(set(dgp) - set(DGP_KEYS))
+    if unknown_dgp:
+        raise ValueError(f"unknown dgp key(s): {unknown_dgp}; allowed: {list(DGP_KEYS)}")
     innovation = dgp.get("innovation")
     if innovation not in ("gaussian", "student_t"):
         raise ValueError("dgp.innovation must be 'gaussian' or 'student_t'")
-    if innovation == "student_t" and not dgp.get("nu"):
-        raise ValueError("dgp.nu is required for student_t innovation")
+    for req_key in ("omega", "a", "b"):
+        if req_key not in dgp:
+            raise ValueError(f"dgp.{req_key} is required for synthetic runs")
+    omega = _require_real(dgp["omega"], name="dgp.omega")
+    a = _require_real(dgp["a"], name="dgp.a")
+    b = _require_real(dgp["b"], name="dgp.b")
+    if omega <= 0.0:
+        raise ValueError(f"dgp.omega must be positive, got {omega!r}")
+    if a < 0.0 or b < 0.0 or a + b >= 1.0:
+        raise ValueError(f"dgp requires a >= 0, b >= 0 and a + b < 1, got a={a!r}, b={b!r}")
+    if "burn_in" in dgp:
+        _require_int(dgp["burn_in"], name="dgp.burn_in", min_value=0)
+    if "initial_variance" in dgp:
+        iv = _require_real(dgp["initial_variance"], name="dgp.initial_variance")
+        if iv <= 0.0:
+            raise ValueError(f"dgp.initial_variance must be positive, got {iv!r}")
+    if innovation == "student_t":
+        if "nu" not in dgp or dgp["nu"] is None:
+            raise ValueError("dgp.nu is required for student_t innovation")
+        validate_nu(_require_real(dgp["nu"], name="dgp.nu"))
+    elif dgp.get("nu") is not None:
+        raise ValueError("dgp.nu is only valid for student_t innovation")
+
     if "partitions" not in resolved:
         raise ValueError("synthetic runs require 'partitions'")
-    for key in resolved.get("splits", ("train", "validation", "test")):
-        if key not in resolved["partitions"]:
+    partitions = resolved["partitions"]
+    if not isinstance(partitions, dict):
+        raise ValueError("'partitions' must be a JSON object")
+    unknown_parts = sorted(set(partitions) - set(VALID_SPLITS))
+    if unknown_parts:
+        raise ValueError(
+            f"unknown split key(s) in 'partitions': {unknown_parts}; expected subset of {list(VALID_SPLITS)}"
+        )
+
+    if "seeds" not in resolved:
+        raise ValueError("synthetic runs require 'seeds'")
+    seeds = resolved["seeds"]
+    if not isinstance(seeds, dict):
+        raise ValueError("'seeds' must be a JSON object")
+    unknown_seeds = sorted(set(seeds) - set(VALID_SPLITS))
+    if unknown_seeds:
+        raise ValueError(
+            f"unknown split key(s) in 'seeds': {unknown_seeds}; expected subset of {list(VALID_SPLITS)}"
+        )
+
+    for key in resolved.get("splits", VALID_SPLITS):
+        if key not in partitions:
             raise ValueError(f"missing partition length: {key}")
-        if not isinstance(resolved["partitions"][key], int) or resolved["partitions"][key] <= 0:
-            raise ValueError(f"partition {key} must be a positive integer")
-        if key not in resolved["seeds"]:
+        _require_int(partitions[key], name=f"partitions.{key}", min_value=1)
+        if key not in seeds:
             raise ValueError(f"missing seed for partition: {key}")
+        _require_int(seeds[key], name=f"seeds.{key}", min_value=0)
     return resolved
 
 
@@ -187,13 +297,8 @@ def _resolve_panel(resolved: dict) -> dict:
     from .data import validate_cutoffs
 
     data = resolved["data"]
-    incompatible = [key for key in ("dgp", "partitions", "seeds") if key in resolved]
-    if incompatible:
-        raise ValueError(
-            f"data.kind='{DATASET_PANEL}' is incompatible with {incompatible}; "
-            "a real panel supplies its own history, splits and dates"
-        )
-    if not data.get("panel"):
+    panel = data.get("panel")
+    if not isinstance(panel, str) or not panel.strip():
         raise ValueError("data.panel is required for a returns_panel run")
     audit = data.get("audit")
     if audit is not None and not isinstance(audit, str):
@@ -205,13 +310,15 @@ def _resolve_panel(resolved: dict) -> dict:
 
     # Extract cutoffs directly from resolved or from data.audit
     cutoffs = resolved.get("cutoffs")
+    if cutoffs is not None and not isinstance(cutoffs, dict):
+        raise ValueError("'cutoffs' must be a JSON object when given")
     if cutoffs is None and audit:
         audit_path = Path(audit)
         if not audit_path.exists():
             raise ValueError(f"data.audit file does not exist: {audit}")
         try:
             audit_dict = json.loads(audit_path.read_text(encoding="utf-8"))
-        except Exception as exc:
+        except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"data.audit is malformed JSON: {exc}") from exc
         cutoffs = audit_dict.get("cutoffs") or audit_dict.get("splits", {}).get("cutoffs")
 
@@ -237,6 +344,30 @@ def _resolve_config(config: dict) -> dict:
         raise ValueError("config 'data' must be an object when present")
     if kind not in (DATASET_SYNTHETIC, DATASET_PANEL):
         raise ValueError(f"unsupported data.kind {kind!r}; expected one of {[DATASET_SYNTHETIC, DATASET_PANEL]}")
+
+    if kind == DATASET_PANEL:
+        incompatible = [key for key in ("dgp", "partitions", "seeds") if key in resolved]
+        if incompatible:
+            raise ValueError(
+                f"data.kind='{DATASET_PANEL}' is incompatible with {incompatible}; "
+                "a real panel supplies its own history, splits and dates"
+            )
+        unknown_top = sorted(set(resolved) - set(PANEL_RUN_KEYS))
+        if unknown_top:
+            raise ValueError(
+                f"unknown config key(s): {unknown_top}; allowed for {kind!r}: {list(PANEL_RUN_KEYS)}"
+            )
+    else:
+        if isinstance(data, dict):
+            unknown_data = sorted(set(data) - {"kind"})
+            if unknown_data:
+                raise ValueError(f"unknown data keys for {kind!r}: {unknown_data}")
+        unknown_top = sorted(set(resolved) - set(SYNTHETIC_RUN_KEYS))
+        if unknown_top:
+            raise ValueError(
+                f"unknown config key(s): {unknown_top}; allowed for {kind!r}: {list(SYNTHETIC_RUN_KEYS)}"
+            )
+
     resolved["data_kind"] = kind
     resolved["dataset_kind"] = "real" if kind == DATASET_PANEL else "synthetic"
     resolved = _resolve_common(resolved)
@@ -246,6 +377,14 @@ def _resolve_config(config: dict) -> dict:
     if "dgp" not in resolved:
         raise ValueError("synthetic runs require 'dgp'")
     return _resolve_synthetic(resolved)
+
+
+def _preflight_builtin_dependencies(models: list[str]) -> None:
+    """Import optional dependencies for configured built-ins before writing any output."""
+    if MODEL_GARCH_T in models:
+        from .models import garch_t as _garch_t  # noqa: F401
+    if MODEL_JOINT_MLP in models:
+        from .models import joint_mlp_training as _joint_mlp_training  # noqa: F401
 
 
 def _manifest(config: dict, resolved: dict, start: float, status: str) -> dict:
@@ -770,7 +909,8 @@ def cmd_run(config_path: str, output: str) -> int:
             resolved.get("custom_models"), selected=resolved["models"]
         )
         custom_instances = {name: factory.build() for name, factory in custom.items()}
-    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        _preflight_builtin_dependencies(resolved["models"])
+    except (ValueError, OSError, json.JSONDecodeError, OptionalDependencyError) as exc:
         print(f"run failed: {exc}", file=sys.stderr)
         return 2
 
@@ -814,7 +954,7 @@ def cmd_run(config_path: str, output: str) -> int:
             if run.summary:
                 fit_info[model_name] = run.summary
             coverage[model_name] = run.coverage
-    except (ValueError, RuntimeError) as exc:
+    except (ValueError, RuntimeError, OptionalDependencyError) as exc:
         print(f"run failed: {exc}", file=sys.stderr)
         return 2
 
